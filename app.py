@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+"""Streamlit UI for interactive ROS2 mapping workflow.
+
+Layout:
+  - Sidebar: step progress, file paths, abort
+  - Left panel: screen session management (independent of workflow)
+  - Right panel: mapping workflow steps
+"""
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Mapping Scripts", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Path constants
+# ---------------------------------------------------------------------------
+HOME = Path.home()
+ALGOR_WS = HOME / "Workspace" / "algor_ws" / "src"
+ALGOR_WS_ROOT = ALGOR_WS.parent
+FASTER_SLAM = ALGOR_WS / "faster-slam"
+PGO_OUTPUT = FASTER_SLAM / "data" / "PGO_output"
+PRIOR_DIR = FASTER_SLAM / "prior"
+GRIDMAPPER_OUTPUT = ALGOR_WS / "gridmapper" / "data" / "Output"
+MAPS_DIR = ALGOR_WS / "multi_map_nav_ros2" / "maps"
+
+# ROS2 launch commands
+LIVOX_LAUNCH_CMD = "ros2 launch livox_ros_driver2 msg_multi_MID360_launch.py"
+NAV_BRIDGE_LAUNCH_CMD = "ros2 launch nav_bridge nav_bridge.launch.py"
+SLAM_PGO_LAUNCH_CMD = "ros2 launch faster_lio slam.launch.py pgo:=true rviz:=true"
+RELOCAL_LAUNCH_CMD = "ros2 launch faster_lio slam.launch.py relocal:=true prior_dir:={prior}"
+GRIDMAPPER_LAUNCH_CMD = "ros2 launch gridmapper global.launch.py rviz:=true"
+
+LIVOX_TOPIC = "/livox/lidar"
+IMU_TOPIC = "/imu/data"
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+
+def _ros2_env() -> dict:
+    env = os.environ.copy()
+    distro = env.get("ROS_DISTRO", "")
+    if not distro:
+        opt_ros = Path("/opt/ros")
+        if opt_ros.is_dir():
+            candidates = [d.name for d in opt_ros.iterdir() if d.is_dir()]
+            if candidates:
+                distro = candidates[0]
+    if distro:
+        ros_prefix = f"/opt/ros/{distro}"
+        env["ROS_DISTRO"] = distro
+        env.setdefault("ROS_PACKAGE_PATH", "")
+        env["ROS_PACKAGE_PATH"] = f"{ros_prefix}/share:{env['ROS_PACKAGE_PATH']}"
+        env["PATH"] = f"{ros_prefix}/bin:{env['PATH']}"
+    setup_bash = ALGOR_WS_ROOT / "install" / "setup.bash"
+    if setup_bash.exists():
+        install_prefix = str(ALGOR_WS_ROOT / "install")
+        env.setdefault("ROS_PACKAGE_PATH", "")
+        env["ROS_PACKAGE_PATH"] = f"{install_prefix}/share:{env['ROS_PACKAGE_PATH']}"
+        env["PATH"] = f"{install_prefix}:{env['PATH']}"
+        minor = sys.version_info.minor
+        py_path = f"{install_prefix}/lib/python3.{minor}/site-packages"
+        env.setdefault("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{py_path}:{env['PYTHONPATH']}"
+    return env
+
+
+ROS2_ENV = _ros2_env()
+
+# ---------------------------------------------------------------------------
+# Screen session registry  (persisted in st.session_state)
+# ---------------------------------------------------------------------------
+
+KNOWN_SESSIONS = [
+    {"name": "livox", "label": "Livox Lidar"},
+    {"name": "nav_bridge", "label": "nav_bridge IMU"},
+    {"name": "slam", "label": "PGO SLAM + Rviz"},
+    {"name": "bag_rec", "label": "Bag Recording"},
+    {"name": "relocal", "label": "Relocalization"},
+    {"name": "gridmapper", "label": "Grid Mapper + Rviz"},
+    {"name": "bag_play", "label": "Bag Playback"},
+    {"name": "build", "label": "colcon Build"},
+]
+
+SESSION_LABEL = {s["name"]: s["label"] for s in KNOWN_SESSIONS}
+SESSION_NAMES = [s["name"] for s in KNOWN_SESSIONS]
+
+
+def _init_sessions():
+    if "sessions" not in st.session_state:
+        st.session_state.sessions = {}
+
+
+def _register_session(name: str, cmd: str, log_file: str):
+    st.session_state.sessions[name] = {"cmd": cmd, "log_file": log_file}
+
+
+def _get_session(name: str) -> dict | None:
+    return st.session_state.sessions.get(name)
+
+
+def _session_alive(name: str) -> bool:
+    result = subprocess.run(
+        f"screen -list | grep -q '{name}:'", shell=True, capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _force_kill(name: str) -> None:
+    try:
+        result = subprocess.run(
+            f"screen -list | grep '{name}:' | awk -F. '{{print $1}}'",
+            shell=True, capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            pid = line.strip()
+            if pid and pid.isdigit():
+                try:
+                    subprocess.run(f"kill -9 {pid}", shell=True, timeout=5)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    time.sleep(0.3)
+
+
+def _send_ctrl_c(name: str) -> None:
+    try:
+        subprocess.run(
+            f"screen -S {name} -p 0 -X stuff '\\003'", shell=True,
+        )
+    except Exception:
+        pass
+
+
+def screen_launch(name: str, cmd: str) -> str:
+    _force_kill(name)
+    log_file = tempfile.NamedTemporaryFile(
+        prefix=f"mapping_{name}_", suffix=".log", delete=False, mode="w",
+    ).name
+    full_cmd = f"stdbuf -oL -eL {cmd} 2>&1 | tee -a {log_file}"
+    subprocess.run(
+        f"screen -dmS {name} bash -c '{full_cmd}'",
+        shell=True, env=ROS2_ENV,
+    )
+    time.sleep(0.5)
+    _register_session(name, cmd, log_file)
+    return log_file
+
+
+def screen_stop(name: str, sig: int = signal.SIGTERM) -> None:
+    if not _session_alive(name):
+        return
+    if sig == signal.SIGINT:
+        _send_ctrl_c(name)
+        time.sleep(1)
+        if _session_alive(name):
+            _force_kill(name)
+    else:
+        _force_kill(name)
+
+
+def screen_restart(name: str) -> str | None:
+    info = _get_session(name)
+    if not info:
+        return None
+    _force_kill(name)
+    return screen_launch(name, info["cmd"])
+
+
+def screen_stop_all() -> None:
+    for name in list(st.session_state.sessions.keys()):
+        _force_kill(name)
+
+
+def screen_read_log(name: str, max_lines: int = 100) -> str:
+    info = _get_session(name)
+    if not info:
+        return "(session not registered)"
+    try:
+        result = subprocess.run(
+            f"tail -n {max_lines} {info['log_file']}",
+            shell=True, capture_output=True, text=True, timeout=3,
+        )
+        return result.stdout or "(empty)"
+    except FileNotFoundError:
+        return "(log file not found)"
+    except Exception as e:
+        return f"(error: {e})"
+
+
+def screen_read_log_full(name: str) -> str:
+    info = _get_session(name)
+    if not info:
+        return ""
+    try:
+        return Path(info["log_file"]).read_text()
+    except FileNotFoundError:
+        return ""
+
+
+_init_sessions()
+
+# ---------------------------------------------------------------------------
+# ROS2 query helpers
+# ---------------------------------------------------------------------------
+
+
+def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
+    try:
+        result = subprocess.run(
+            cmd, shell=True, env=ROS2_ENV,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return None
+
+
+def check_topic_publishers(topic: str) -> int:
+    output = run_ros2_cmd(f"ros2 topic info {topic} --no-arr")
+    if not output:
+        return -1
+    for line in output.splitlines():
+        if "Publisher count:" in line:
+            return int(line.split(":")[1].strip())
+    return 0
+
+
+def check_node_exists(node_name: str) -> bool:
+    output = run_ros2_cmd("ros2 node list")
+    return output is not None and node_name in output
+
+
+def get_topic_hz(topic: str, timeout: int = 8) -> float:
+    output = run_ros2_cmd(
+        f"ros2 topic hz {topic} --window 3 --timeout {timeout}",
+        timeout=timeout + 5,
+    )
+    if not output:
+        return 0.0
+    for line in output.splitlines():
+        if "average rate:" in line:
+            try:
+                return float(line.split("average rate:")[1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
+
+
+def find_bag_dir(bag_name: str) -> str | None:
+    for p in sorted(Path(".").glob(f"{bag_name}_*")):
+        if p.is_dir():
+            return str(p)
+    return None
+
+
+def rename_grid_map(old_name: str, new_name: str) -> list[str]:
+    messages = []
+    for ext in (".png", ".yaml", ".txt"):
+        old_path = GRIDMAPPER_OUTPUT / f"{old_name}{ext}"
+        new_path = GRIDMAPPER_OUTPUT / f"{new_name}{ext}"
+        if old_path.exists():
+            if new_path.exists():
+                new_path.unlink()
+            old_path.rename(new_path)
+            messages.append(f"Renamed {old_path.name} -> {new_path.name}")
+    yaml_path = GRIDMAPPER_OUTPUT / f"{new_name}.yaml"
+    if yaml_path.exists():
+        content = yaml_path.read_text()
+        fixed = re.sub(
+            r"(image:\s*['\"]?)\./?" + re.escape(old_name) + r"\.png(['\"]?)",
+            r"\1" + new_name + ".png\2",
+            content,
+        )
+        if fixed != content:
+            yaml_path.write_text(fixed)
+            messages.append(f"Updated image path in {new_name}.yaml")
+    return messages
+
+
+def copy_grid_map(map_name: str) -> list[str]:
+    messages = []
+    MAPS_DIR.mkdir(parents=True, exist_ok=True)
+    for ext in (".png", ".yaml"):
+        src = GRIDMAPPER_OUTPUT / f"{map_name}{ext}"
+        if src.exists():
+            shutil.copy2(src, MAPS_DIR / src.name)
+            messages.append(f"Copied {src.name} -> {MAPS_DIR}/")
+    conn_src = GRIDMAPPER_OUTPUT / "map_connections.txt"
+    if conn_src.exists():
+        shutil.copy2(conn_src, MAPS_DIR / conn_src.name)
+        messages.append(f"Copied map_connections.txt -> {MAPS_DIR}/")
+    return messages
+
+
+def copy_pgo_to_prior(map_name: str) -> list[str]:
+    messages = []
+    pgo_pcd = PGO_OUTPUT / "PGO.pcd"
+    pgo_kf = PGO_OUTPUT / "keyframes"
+    if not pgo_pcd.exists():
+        return [f"ERROR: {pgo_pcd} not found"]
+    if not pgo_kf.is_dir():
+        return [f"ERROR: {pgo_kf} not found"]
+    dest = PRIOR_DIR / map_name
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(pgo_pcd, dest / "PGO.pcd")
+    messages.append(f"Copied PGO.pcd -> {dest}/")
+    if (dest / "keyframes").exists():
+        shutil.rmtree(dest / "keyframes")
+    shutil.copytree(pgo_kf, dest / "keyframes")
+    messages.append(f"Copied keyframes/ -> {dest}/keyframes/")
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Workflow state
+# ---------------------------------------------------------------------------
+
+STEP_DEFS = [
+    {"id": 0, "name": "Init"},
+    {"id": 1, "name": "Sensor Setup"},
+    {"id": 2, "name": "PGO SLAM"},
+    {"id": 3, "name": "Grid Map"},
+    {"id": 4, "name": "Complete"},
+]
+
+
+def _init_state():
+    defaults = {
+        "current_step": 0,
+        "current_sub": "start",
+        "map_name": "",
+        "bag_name": "",
+        "bag_dir": None,
+        "step_messages": [],
+        "step1_livox_hz": 0.0,
+        "step1_imu_hz": 0.0,
+        "pgo_last_size": -1,
+        "pgo_stable_count": 0,
+        "selected_session": KNOWN_SESSIONS[0]["name"],
+        "log_auto_refresh": True,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+_init_state()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def add_message(msg: str):
+    stamp = datetime.now().strftime("%H:%M:%S")
+    st.session_state.step_messages.insert(0, f"[{stamp}] {msg}")
+    st.session_state.step_messages = st.session_state.step_messages[:50]
+
+
+def get_wait_start():
+    return getattr(st.session_state, "wait_start", time.monotonic())
+
+
+def clear_wait_state():
+    if "wait_start" in st.session_state:
+        del st.session_state.wait_start
+
+
+def file_size_human(p: Path) -> str:
+    size = p.stat().st_size
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
+def step_status(step_id: int) -> str:
+    if st.session_state.current_step > step_id:
+        return "done"
+    if st.session_state.current_step == step_id:
+        return "running"
+    return "not_started"
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+
+def render_sidebar():
+    st.sidebar.title("Mapping")
+
+    for sdef in STEP_DEFS:
+        sid = sdef["id"]
+        status = step_status(sid)
+        if status == "done":
+            st.sidebar.markdown(f">&#10004; **Step {sid}**: {sdef['name']}")
+        elif status == "running":
+            st.sidebar.markdown(f">&#9654; **Step {sid}**: {sdef['name']}")
+        else:
+            st.sidebar.markdown(f"  Step {sid}: {sdef['name']}")
+
+    st.sidebar.divider()
+
+    with st.sidebar.expander("File Paths", expanded=False):
+        mn = st.session_state.map_name or "(TBD)"
+        bd = st.session_state.bag_dir or "(TBD)"
+        st.markdown(
+            f"**PGO output:** `{PGO_OUTPUT}`\n\n"
+            f"**Prior:** `{PRIOR_DIR}/{mn}`\n\n"
+            f"**Bag:** `{bd}`\n\n"
+            f"**Grid map:** `{GRIDMAPPER_OUTPUT}`\n\n"
+            f"**Nav maps:** `{MAPS_DIR}`"
+        )
+
+    if 0 < st.session_state.current_step < 4:
+        st.sidebar.divider()
+        if st.sidebar.button("Abort Mapping", type="primary", key="sidebar_abort"):
+            screen_stop_all()
+            add_message("ABORT: All sessions stopped")
+            st.session_state.current_step = 0
+            st.session_state.current_sub = "start"
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# LEFT PANEL - Session management (independent of workflow)
+# ---------------------------------------------------------------------------
+
+
+def render_left_panel():
+    st.header("Sessions")
+
+    # Session selector
+    selected = st.selectbox(
+        "Select session",
+        options=SESSION_NAMES,
+        index=SESSION_NAMES.index(
+            st.session_state.selected_session
+        ) if st.session_state.selected_session in SESSION_NAMES else 0,
+        format_func=lambda n: SESSION_LABEL.get(n, n),
+    )
+    st.session_state.selected_session = selected
+
+    # Live status
+    alive = _session_alive(selected)
+    info = _get_session(selected)
+
+    status_icon = "&#9989;" if alive else "&#9760;"
+    st.markdown(f"**Status:** {status_icon} {'running' if alive else 'stopped'}")
+
+    if info:
+        st.caption(f"Command: `{info['cmd']}`")
+        st.caption(f"Log: `{info['log_file']}`")
+    else:
+        st.caption("Not yet launched")
+
+    # Controls
+    ctrl_cols = st.columns(4)
+    with ctrl_cols[0]:
+        if st.button("Refresh", key=f"left_refresh_{selected}"):
+            st.rerun()
+    with ctrl_cols[1]:
+        if alive:
+            if st.button("Stop", key=f"left_stop_{selected}", type="primary"):
+                screen_stop(selected)
+                add_message(f"Stopped {selected}")
+                st.rerun()
+        else:
+            if st.button("Restart", key=f"left_restart_{selected}"):
+                result = screen_restart(selected)
+                if result:
+                    add_message(f"Restarted {selected}")
+                else:
+                    add_message(f"Unknown session: {selected}")
+                st.rerun()
+    with ctrl_cols[2]:
+        if info and info["log_file"] and Path(info["log_file"]).exists():
+            st.download_button(
+                "DL Log",
+                data=screen_read_log_full(selected),
+                file_name=f"{selected}.log",
+                mime="text/plain",
+                key=f"left_dl_{selected}",
+            )
+
+    st.divider()
+
+    # Log viewer
+    st.subheader("Log")
+    auto_refresh = st.checkbox(
+        "Auto-refresh", key="log_auto_refresh",
+    )
+
+    log_text = screen_read_log(selected, max_lines=200)
+    st.code(log_text, language="text", height=500)
+
+    if auto_refresh:
+        time.sleep(2)
+        st.rerun()
+
+    # All sessions overview (compact)
+    st.divider()
+    st.subheader("All Sessions")
+    for sess in KNOWN_SESSIONS:
+        name = sess["name"]
+        a = _session_alive(name)
+        icon = "+" if a else "o"
+        st.markdown(f"{icon} **{sess['label']}** {'(running)' if a else ''}")
+
+
+# ---------------------------------------------------------------------------
+# RIGHT PANEL - Mapping workflow
+# ---------------------------------------------------------------------------
+
+
+def render_messages():
+    messages = st.session_state.step_messages
+    if messages:
+        with st.expander("Messages", expanded=True):
+            for msg in messages:
+                if "ERROR" in msg:
+                    st.error(msg)
+                elif "WARN" in msg:
+                    st.warning(msg)
+                elif any(kw in msg for kw in ("OK", "Copied", "Renamed", "ready")):
+                    st.success(msg)
+                else:
+                    st.text(msg)
+
+
+def render_step0():
+    st.header("Step 0: Initialization")
+
+    setup_path = ALGOR_WS_ROOT / "install" / "setup.bash"
+    ws_info = f"Workspace: `{ALGOR_WS_ROOT}`\nROS_DISTRO: `{ROS2_ENV.get('ROS_DISTRO', 'N/A')}`"
+    if not setup_path.exists():
+        st.warning("install/setup.bash not found. Source it or rebuild first.")
+    st.info(ws_info)
+
+    st.markdown(
+        """
+        This tool guides you through the full mapping workflow:
+
+        1. **Sensor Setup** - Start Livox Lidar and nav_bridge IMU
+        2. **PGO SLAM** - 3D pointcloud map construction
+        3. **Grid Map** - Offline grid map from bag playback
+        4. **Complete** - Cleanup and finish
+        """
+    )
+
+    if st.button("Start Workflow", type="primary", key="btn_step0_start"):
+        st.session_state.current_step = 1
+        st.session_state.current_sub = "start_livox"
+        st.session_state.step_messages = []
+        st.rerun()
+
+
+def render_step1():
+    st.header("Step 1: Sensor Data Acquisition")
+    sub = st.session_state.current_sub
+
+    # Start Livox
+    if sub == "start_livox":
+        st.markdown("**Start the Livox lidar node.**")
+        if st.button("Start Livox Lidar", type="primary", key="btn_s1_livox"):
+            add_message("Starting Livox lidar...")
+            screen_launch("livox", LIVOX_LAUNCH_CMD)
+            st.session_state.current_sub = "wait_livox"
+            st.session_state.wait_start = time.monotonic()
+            st.rerun()
+
+    if sub == "wait_livox":
+        elapsed = time.monotonic() - get_wait_start()
+        st.progress(min(elapsed / 20, 1.0))
+        st.caption(f"Waiting for {LIVOX_TOPIC} publisher... ({elapsed:.0f}s / 20s)")
+
+        pub_count = check_topic_publishers(LIVOX_TOPIC)
+        if pub_count > 0:
+            hz = get_topic_hz(LIVOX_TOPIC)
+            st.session_state.step1_livox_hz = hz
+            st.session_state.current_sub = "start_nav"
+            clear_wait_state()
+            add_message(f"{LIVOX_TOPIC} active ({pub_count} publishers, ~{hz:.1f} Hz)")
+            st.rerun()
+        elif elapsed >= 20:
+            st.session_state.current_sub = "start_nav"
+            clear_wait_state()
+            add_message(f"WARN: No publisher on {LIVOX_TOPIC} after 20s")
+            st.rerun()
+
+    # Livox status after launch
+    if sub in ("start_nav", "wait_nav", "release_control"):
+        alive = _session_alive("livox")
+        hz_text = f"~{st.session_state.step1_livox_hz:.1f} Hz" if st.session_state.step1_livox_hz > 0 else ""
+        st.markdown(f"**Livox:** {'running' if alive else 'stopped'} {hz_text}")
+
+    # Start nav_bridge
+    if sub == "start_nav":
+        st.markdown("**Start the nav_bridge IMU node.**")
+        if st.button("Start nav_bridge", type="primary", key="btn_s1_nav"):
+            add_message("Starting nav_bridge for IMU...")
+            screen_launch("nav_bridge", NAV_BRIDGE_LAUNCH_CMD)
+            st.session_state.current_sub = "wait_nav"
+            st.session_state.wait_start = time.monotonic()
+            st.rerun()
+
+    if sub == "wait_nav":
+        elapsed = time.monotonic() - get_wait_start()
+        st.progress(min(elapsed / 20, 1.0))
+        st.caption(f"Waiting for {IMU_TOPIC} publisher... ({elapsed:.0f}s / 20s)")
+
+        pub_count = check_topic_publishers(IMU_TOPIC)
+        if pub_count > 0:
+            hz = get_topic_hz(IMU_TOPIC)
+            st.session_state.step1_imu_hz = hz
+            st.session_state.current_sub = "release_control"
+            clear_wait_state()
+            add_message(f"{IMU_TOPIC} active ({pub_count} publishers, ~{hz:.1f} Hz)")
+            st.rerun()
+        elif elapsed >= 20:
+            st.session_state.current_sub = "release_control"
+            clear_wait_state()
+            add_message(f"WARN: No publisher on {IMU_TOPIC} after 20s")
+            st.rerun()
+
+    # nav_bridge status
+    if sub == "release_control":
+        alive = _session_alive("nav_bridge")
+        hz_text = f"~{st.session_state.step1_imu_hz:.1f} Hz" if st.session_state.step1_imu_hz > 0 else ""
+        st.markdown(f"**nav_bridge:** {'running' if alive else 'stopped'} {hz_text}")
+
+    # Release control
+    if sub == "release_control":
+        st.markdown("**Release remote control so the robot accepts commands.**")
+        if st.button("Release Control", type="primary", key="btn_s1_release"):
+            add_message("Calling /nav_bridge_node/release_control...")
+            output = run_ros2_cmd(
+                "ros2 service call /nav_bridge_node/release_control std_srvs/srv/Trigger"
+            )
+            add_message(f"Control released: {output or 'OK'}")
+            st.session_state.current_step = 2
+            st.session_state.current_sub = "stand_up"
+            if not st.session_state.map_name:
+                st.session_state.map_name = datetime.now().strftime("sensor_%y%m%d_%H%M")
+            st.session_state.step_messages = []
+            st.rerun()
+
+
+def render_step2():
+    st.header("Step 2: PGO SLAM - 3D Pointcloud Map")
+    sub = st.session_state.current_sub
+
+    # Map name
+    map_name = st.text_input(
+        "Map name", value=st.session_state.map_name, key="map_name_input",
+    )
+    st.session_state.map_name = map_name
+
+    # Stand up
+    if sub == "stand_up":
+        st.markdown(
+            "**Use the remote controller to stand up the robot.** "
+            "Once standing, click below."
+        )
+        if st.button("Robot is Standing", type="primary", key="btn_s2_stand"):
+            add_message("Robot is standing")
+            st.session_state.current_sub = "start_slam"
+            st.rerun()
+
+    # Start SLAM
+    if sub == "start_slam":
+        st.markdown("**Start the SLAM node with PGO + Rviz.**")
+        if st.button("Start SLAM + Rviz", type="primary", key="btn_s2_slam"):
+            add_message("Starting SLAM with PGO + Rviz...")
+            screen_launch("slam", SLAM_PGO_LAUNCH_CMD)
+            st.session_state.current_sub = "wait_slam"
+            st.session_state.wait_start = time.monotonic()
+            st.rerun()
+
+    if sub == "wait_slam":
+        elapsed = time.monotonic() - get_wait_start()
+        st.progress(min(elapsed / 30, 1.0))
+        st.caption(f"Waiting for `laser_mapping` node... ({elapsed:.0f}s / 30s)")
+
+        if check_node_exists("laser_mapping"):
+            st.session_state.current_sub = "start_bag"
+            clear_wait_state()
+            add_message("laser_mapping node is running")
+            st.rerun()
+        elif elapsed >= 30:
+            st.session_state.current_sub = "start_bag"
+            clear_wait_state()
+            add_message("WARN: laser_mapping not detected after 30s")
+            st.rerun()
+
+    # SLAM status
+    if sub in ("start_bag", "navigate"):
+        alive = _session_alive("slam")
+        st.markdown(f"**SLAM:** {'running' if alive else 'stopped'}")
+
+    # Start bag recording
+    if sub == "start_bag":
+        bag_name = f"{map_name}_sensor"
+        st.session_state.bag_name = bag_name
+        st.markdown(
+            f"**Start recording** `{LIVOX_TOPIC}` and `{IMU_TOPIC}` to bag `{bag_name}`."
+        )
+        if st.button("Start Recording", type="primary", key="btn_s2_bag"):
+            add_message(f"Recording bag '{bag_name}'...")
+            cmd = f"ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
+            screen_launch("bag_rec", cmd)
+            st.session_state.current_sub = "navigate"
+            add_message(f"Recording to {bag_name}/")
+            st.rerun()
+
+    # Navigate
+    if sub == "navigate":
+        rec_alive = _session_alive("bag_rec")
+        slam_alive = _session_alive("slam")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**SLAM:** {'running' if slam_alive else 'stopped'}")
+        with c2:
+            st.markdown(f"**Bag recording:** {'running' if rec_alive else 'stopped'}")
+
+        st.markdown(
+            """
+            **Drive the robot** through the scene with the remote controller.
+            - Watch Rviz for loop closures and map quality
+            - Keep dynamic objects out of the robot's frontal view
+            """
+        )
+
+        if st.button("Mapping Complete", type="primary", key="btn_s2_done"):
+            add_message("Mapping complete - stopping bag recording...")
+            screen_stop("bag_rec")
+            add_message("Bag recording stopped")
+            add_message("Stopping SLAM (SIGINT for PGO output)...")
+            screen_stop("slam", signal.SIGINT)
+            st.session_state.current_sub = "wait_pgo"
+            st.session_state.wait_start = time.monotonic()
+            st.rerun()
+
+    # Wait for PGO
+    if sub == "wait_pgo":
+        elapsed = time.monotonic() - get_wait_start()
+        st.progress(min(elapsed / 120, 1.0))
+        st.caption(f"Waiting for PGO output... ({elapsed:.0f}s / 120s)")
+
+        pgo_pcd = PGO_OUTPUT / "PGO.pcd"
+        pgo_kf = PGO_OUTPUT / "keyframes"
+        pcd_exists = pgo_pcd.exists()
+        kf_exists = pgo_kf.is_dir()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if pcd_exists:
+                st.markdown(f"**PGO.pcd:** OK ({file_size_human(pgo_pcd)})")
+            else:
+                st.markdown("**PGO.pcd:** waiting...")
+        with c2:
+            st.markdown(f"**keyframes/**: {'OK' if kf_exists else 'waiting...'}")
+
+        if pcd_exists and kf_exists:
+            cur_size = pgo_pcd.stat().st_size
+            if cur_size == st.session_state.pgo_last_size and cur_size > 0:
+                st.session_state.pgo_stable_count += 1
+            elif cur_size > 0:
+                st.session_state.pgo_last_size = cur_size
+                st.session_state.pgo_stable_count = 0
+
+            if st.session_state.pgo_stable_count >= 3:
+                st.session_state.current_sub = "copy_pgo"
+                clear_wait_state()
+                st.session_state.pgo_last_size = -1
+                st.session_state.pgo_stable_count = 0
+                add_message("PGO output ready and stable")
+                st.rerun()
+
+            st.caption(f"Size stability: {st.session_state.pgo_stable_count} / 3")
+            time.sleep(3)
+            st.rerun()
+        elif elapsed >= 120:
+            if pcd_exists and kf_exists:
+                add_message("WARN: PGO output found but size still changing")
+            else:
+                add_message("WARN: PGO output not ready after 120s")
+            st.session_state.current_sub = "copy_pgo"
+            clear_wait_state()
+            st.rerun()
+
+    # Copy PGO
+    if sub == "copy_pgo":
+        pgo_pcd = PGO_OUTPUT / "PGO.pcd"
+        pgo_kf = PGO_OUTPUT / "keyframes"
+        if pgo_pcd.exists() and pgo_kf.is_dir():
+            st.markdown(
+                f"**PGO output is ready.** Click to copy to `prior/{map_name}/`."
+            )
+            if st.button(f"Copy to prior/{map_name}/", type="primary", key="btn_s2_copy"):
+                msgs = copy_pgo_to_prior(map_name)
+                for m in msgs:
+                    add_message(m)
+                bag_dir = find_bag_dir(st.session_state.bag_name)
+                st.session_state.bag_dir = bag_dir
+                if bag_dir:
+                    add_message(f"Bag saved at ./{bag_dir}")
+                else:
+                    add_message(f"WARN: Bag for '{st.session_state.bag_name}' not found")
+                st.session_state.current_step = 3
+                st.session_state.current_sub = "start_relocal"
+                st.session_state.step_messages = []
+                st.rerun()
+        else:
+            st.warning("PGO output not found. Check logs on the left.")
+            if st.button("Continue to Step 3 (may fail)", key="btn_s2_no_pgo"):
+                st.session_state.current_step = 3
+                st.session_state.current_sub = "start_relocal"
+                st.session_state.step_messages = []
+                st.rerun()
+
+
+def render_step3():
+    st.header("Step 3: Grid Map Construction (Offline)")
+    sub = st.session_state.current_sub
+    map_name = st.session_state.map_name
+    bag_dir = st.session_state.bag_dir
+
+    st.caption(f"Map: `{map_name}` | Bag: `{bag_dir or '(not found)'}`")
+
+    # Start relocalization
+    if sub == "start_relocal":
+        st.markdown("**Start the relocalization node** with the prior map.")
+        relocal_cmd = RELOCAL_LAUNCH_CMD.format(prior=map_name)
+        st.code(relocal_cmd)
+        if st.button("Start Relocalization", type="primary", key="btn_s3_relocal"):
+            add_message(f"Starting relocalization with prior='{map_name}'...")
+            screen_launch("relocal", relocal_cmd)
+            st.session_state.current_sub = "wait_relocal"
+            st.session_state.wait_start = time.monotonic()
+            st.rerun()
+
+    if sub == "wait_relocal":
+        elapsed = time.monotonic() - get_wait_start()
+        st.progress(min(elapsed / 30, 1.0))
+        st.caption(f"Waiting for `laser_mapping` node... ({elapsed:.0f}s / 30s)")
+
+        if check_node_exists("laser_mapping"):
+            st.session_state.current_sub = "start_grid"
+            clear_wait_state()
+            add_message("laser_mapping node is running (relocal mode)")
+            st.rerun()
+        elif elapsed >= 30:
+            st.session_state.current_sub = "start_grid"
+            clear_wait_state()
+            add_message("WARN: laser_mapping not detected after 30s")
+            st.rerun()
+
+    # Relocal status
+    if sub in ("start_grid", "wait_rviz", "start_playback", "wait_playback"):
+        alive = _session_alive("relocal")
+        st.markdown(f"**Relocalization:** {'running' if alive else 'stopped'}")
+
+    # Start grid mapper
+    if sub == "start_grid":
+        st.markdown("**Start the grid mapper + Rviz.**")
+        if st.button("Start Grid Mapper", type="primary", key="btn_s3_grid"):
+            add_message("Starting global grid mapper + Rviz...")
+            screen_launch("gridmapper", GRIDMAPPER_LAUNCH_CMD)
+            st.session_state.current_sub = "wait_rviz"
+            st.rerun()
+
+    if sub == "wait_rviz":
+        alive = _session_alive("gridmapper")
+        st.markdown(f"**Grid Mapper:** {'running' if alive else 'stopped'}")
+        st.markdown("**Wait for Rviz to load**, then click below.")
+        if st.button("Rviz Ready", type="primary", key="btn_s3_rviz"):
+            st.session_state.current_sub = "start_playback"
+            st.rerun()
+
+    # Grid status
+    if sub in ("start_playback", "wait_playback", "observe"):
+        alive = _session_alive("gridmapper")
+        st.markdown(f"**Grid Mapper:** {'running' if alive else 'stopped'}")
+
+    # Start playback
+    if sub == "start_playback":
+        if bag_dir:
+            st.markdown(f"**Play the recorded bag** with `--clock`.")
+            st.code(f"ros2 bag play {bag_dir}/ --clock")
+            if st.button("Start Playback", type="primary", key="btn_s3_play"):
+                add_message(f"Playing bag '{bag_dir}' with --clock...")
+                cmd = f"ros2 bag play {bag_dir}/ --clock"
+                screen_launch("bag_play", cmd)
+                st.session_state.current_sub = "wait_playback"
+                st.rerun()
+        else:
+            st.warning("Bag directory not found.")
+            st.markdown("**Manually run:** `ros2 bag play <your_bag>/ --clock`")
+            if st.button("I've Started Playback Manually", type="primary", key="btn_s3_manual_play"):
+                st.session_state.current_sub = "observe"
+                st.rerun()
+
+    # Wait playback
+    if sub == "wait_playback":
+        play_alive = _session_alive("bag_play")
+        if play_alive:
+            st.markdown("**Bag playback in progress...**")
+            log_tail = screen_read_log("bag_play", max_lines=5)
+            st.code(log_tail, language="text")
+            if st.button("Skip Playback Wait", key="btn_s3_skip_play"):
+                st.session_state.current_sub = "observe"
+                st.rerun()
+            time.sleep(3)
+            st.rerun()
+        else:
+            add_message("Bag playback finished")
+            st.session_state.current_sub = "observe"
+            st.rerun()
+
+    # Observe
+    if sub == "observe":
+        st.markdown(
+            "**Check the grid map in Rviz.** "
+            "When satisfied, click below to stop all nodes."
+        )
+        if st.button("Stop All Nodes", type="primary", key="btn_s3_stop"):
+            st.session_state.current_sub = "stop_nodes"
+            st.rerun()
+
+    # Stop nodes
+    if sub == "stop_nodes":
+        st.markdown("**Stopping nodes...**")
+        for name in ("bag_play", "gridmapper", "relocal"):
+            if _session_alive(name):
+                screen_stop(name)
+                add_message(f"Stopped {name}")
+            else:
+                add_message(f"{name} already stopped")
+            st.text(f"{name}: {'stopped' if not _session_alive(name) else 'stopping...'}")
+        st.session_state.current_sub = "check_output"
+        st.rerun()
+
+    # Check output
+    if sub == "check_output":
+        st.markdown("**Check the generated map files:**")
+        map_png = GRIDMAPPER_OUTPUT / "map.png"
+        map_yaml = GRIDMAPPER_OUTPUT / "map.yaml"
+        map_conn = GRIDMAPPER_OUTPUT / "map_connections.txt"
+        for f in (map_png, map_yaml, map_conn):
+            if f.exists():
+                st.markdown(f"OK - `{f.name}` ({file_size_human(f)})")
+            else:
+                st.markdown(f"MISSING - `{f.name}`")
+        if map_png.exists():
+            if st.button("Proceed to Rename", type="primary", key="btn_s3_rename_go"):
+                st.session_state.current_sub = "rename"
+                st.rerun()
+
+    # Rename
+    if sub == "rename":
+        st.markdown(f"**Rename** `map.*` -> `{map_name}.*` and update yaml.")
+        if st.button(f"Rename to '{map_name}'", type="primary", key="btn_s3_rename"):
+            msgs = rename_grid_map("map", map_name)
+            for m in msgs:
+                add_message(m)
+            st.session_state.current_sub = "review"
+            st.rerun()
+
+    # Review
+    if sub == "review":
+        st.markdown(
+            f"**Review the map** - open `{map_name}.png` in GIMP if needed.\n\n"
+            "**Do NOT change the resolution.**"
+        )
+        if st.button("Map Looks Good", type="primary", key="btn_s3_review"):
+            st.session_state.current_sub = "copy_maps"
+            st.rerun()
+
+    # Copy to maps
+    if sub == "copy_maps":
+        st.markdown(f"**Copy** map files to `{MAPS_DIR}/` for navigation.")
+        if st.button(f"Copy to {MAPS_DIR.name}/", type="primary", key="btn_s3_copy"):
+            msgs = copy_grid_map(map_name)
+            for m in msgs:
+                add_message(m)
+            st.session_state.current_sub = "rebuild"
+            st.rerun()
+
+    # Rebuild
+    if sub == "rebuild":
+        st.markdown(
+            f"**Rebuild** the navigation module.\n\n"
+            f"`colcon build --packages-select multi_map_nav_ros2`"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Rebuild Now", type="primary", key="btn_s3_rebuild"):
+                add_message("Running colcon build...")
+                cmd = f"cd {ALGOR_WS_ROOT} && colcon build --packages-select multi_map_nav_ros2 2>&1"
+                screen_launch("build", cmd)
+                st.session_state.current_sub = "wait_build"
+                st.rerun()
+        with c2:
+            if st.button("Skip Rebuild", key="btn_s3_skip_rebuild"):
+                add_message("Skipped rebuild")
+                st.session_state.current_step = 4
+                st.session_state.current_sub = "cleanup"
+                st.session_state.step_messages = []
+                st.rerun()
+
+    # Wait build
+    if sub == "wait_build":
+        build_alive = _session_alive("build")
+        if build_alive:
+            st.markdown("**Build in progress...**")
+            log_tail = screen_read_log("build", max_lines=20)
+            st.code(log_tail, language="text")
+            time.sleep(3)
+            st.rerun()
+        else:
+            add_message("Build complete")
+            st.session_state.current_step = 4
+            st.session_state.current_sub = "cleanup"
+            st.session_state.step_messages = []
+            st.rerun()
+
+
+def render_step4():
+    st.header("Workflow Complete")
+    sub = st.session_state.current_sub
+
+    if sub == "cleanup":
+        sessions = list(st.session_state.sessions.items())
+        running = [(n, i) for n, i in sessions if _session_alive(n)]
+
+        if running:
+            names = ", ".join(n for n, _ in running)
+            st.markdown(f"**Remaining running sessions:** {names}")
+            if st.button("Stop All Remaining Sessions", type="primary", key="btn_s4_stop"):
+                for n, _ in running:
+                    screen_stop(n)
+                    add_message(f"Stopped {n}")
+                st.session_state.current_sub = "done"
+                st.rerun()
+        else:
+            st.session_state.current_sub = "done"
+            st.rerun()
+
+    if sub == "done":
+        st.markdown("**All mapping steps are done.**")
+
+        if st.button("Reset Workflow", type="primary", key="btn_s4_reset"):
+            screen_stop_all()
+            # Reset only workflow state, keep sessions registry
+            workflow_keys = [
+                "current_step", "current_sub", "map_name", "bag_name",
+                "bag_dir", "step_messages", "step1_livox_hz", "step1_imu_hz",
+                "pgo_last_size", "pgo_stable_count",
+            ]
+            for k in workflow_keys:
+                if k in st.session_state:
+                    del st.session_state[k]
+            _init_state()
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    st.title("Mapping Scripts")
+    render_sidebar()
+
+    left_col, right_col = st.columns([1, 2])
+
+    with left_col:
+        render_left_panel()
+
+    with right_col:
+        render_messages()
+        st.divider()
+
+        step_renderers = {
+            0: render_step0,
+            1: render_step1,
+            2: render_step2,
+            3: render_step3,
+            4: render_step4,
+        }
+        renderer = step_renderers.get(st.session_state.current_step)
+        if renderer:
+            renderer()
+
+
+if __name__ == "__main__":
+    main()
