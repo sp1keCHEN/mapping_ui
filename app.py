@@ -10,7 +10,6 @@ Layout:
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +35,8 @@ PGO_OUTPUT = FASTER_SLAM / "data" / "PGO_output"
 PRIOR_DIR = FASTER_SLAM / "prior"
 GRIDMAPPER_OUTPUT = ALGOR_WS / "gridmapper" / "data" / "Output"
 MAPS_DIR = ALGOR_WS / "multi_map_nav_ros2" / "maps"
+BAGS_DIR = HOME / "bags"
+LOGS_DIR = ALGOR_WS_ROOT / "mapping_logs"
 
 # ROS2 launch commands
 LIVOX_LAUNCH_CMD = "ros2 launch livox_ros_driver2 msg_multi_MID360_launch.py"
@@ -87,14 +88,14 @@ ROS2_ENV = _ros2_env()
 # ---------------------------------------------------------------------------
 
 KNOWN_SESSIONS = [
-    {"name": "livox", "label": "Livox Lidar"},
-    {"name": "nav_bridge", "label": "nav_bridge IMU"},
-    {"name": "slam", "label": "PGO SLAM + Rviz"},
-    {"name": "bag_rec", "label": "Bag Recording"},
-    {"name": "relocal", "label": "Relocalization"},
-    {"name": "gridmapper", "label": "Grid Mapper + Rviz"},
-    {"name": "bag_play", "label": "Bag Playback"},
-    {"name": "build", "label": "colcon Build"},
+    {"name": "livox", "label": "Livox Lidar", "expected_nodes": ["/livox_lidar_publisher"]},
+    {"name": "nav_bridge", "label": "nav_bridge IMU", "expected_nodes": ["/nav_bridge_node"]},
+    {"name": "slam", "label": "PGO SLAM + Rviz", "expected_nodes": ["/laser_mapping"]},
+    {"name": "bag_rec", "label": "Bag Recording", "expected_nodes": []},
+    {"name": "relocal", "label": "Relocalization", "expected_nodes": ["/laser_mapping"]},
+    {"name": "gridmapper", "label": "Grid Mapper + Rviz", "expected_nodes": ["/gridmapper_node"]},
+    {"name": "bag_play", "label": "Bag Playback", "expected_nodes": []},
+    {"name": "build", "label": "colcon Build", "expected_nodes": []},
 ]
 
 SESSION_LABEL = {s["name"]: s["label"] for s in KNOWN_SESSIONS}
@@ -115,23 +116,48 @@ def _get_session(name: str) -> dict | None:
 
 
 def _session_alive(name: str) -> bool:
+    """Check if a screen session is running.
+
+    Uses `.{name}[[:space:]]` pattern to avoid matching similar names
+    (e.g. `livox` should not match `livox_backup`).
+    """
     result = subprocess.run(
-        f"screen -list | grep -q '{name}:'", shell=True, capture_output=True,
+        f"screen -list | grep -q '\\.{name}[[:space:]]'",
+        shell=True, capture_output=True,
     )
     return result.returncode == 0
+
+
+def _screen_quit(name: str) -> None:
+    """Send quit to a screen session."""
+    try:
+        subprocess.run(f"screen -S {name} -X quit", shell=True, timeout=5)
+    except Exception:
+        pass
 
 
 def _force_kill(name: str) -> None:
     try:
         result = subprocess.run(
-            f"screen -list | grep '{name}:' | awk -F. '{{print $1}}'",
+            f"screen -list | grep '\\.{name}[[:space:]]' | awk -F. '{{print $1}}'",
             shell=True, capture_output=True, text=True, timeout=5,
         )
         for line in result.stdout.strip().splitlines():
             pid = line.strip()
             if pid and pid.isdigit():
                 try:
-                    subprocess.run(f"kill -9 {pid}", shell=True, timeout=5)
+                    script = f"""
+                    kill_tree() {{
+                        local parent=$1
+                        local children=$(pgrep -P $parent)
+                        for child in $children; do
+                            kill_tree $child
+                        done
+                        kill -9 $parent 2>/dev/null
+                    }}
+                    kill_tree {pid}
+                    """
+                    subprocess.run(script, shell=True, executable='/bin/bash', timeout=5)
                 except Exception:
                     pass
     except Exception:
@@ -142,7 +168,7 @@ def _force_kill(name: str) -> None:
 def _send_ctrl_c(name: str) -> None:
     try:
         subprocess.run(
-            f"screen -S {name} -p 0 -X stuff '\\003'", shell=True,
+            ["screen", "-S", name, "-p", "0", "-X", "stuff", "\x03"]
         )
     except Exception:
         pass
@@ -150,9 +176,9 @@ def _send_ctrl_c(name: str) -> None:
 
 def screen_launch(name: str, cmd: str) -> str:
     _force_kill(name)
-    log_file = tempfile.NamedTemporaryFile(
-        prefix=f"mapping_{name}_", suffix=".log", delete=False, mode="w",
-    ).name
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = str(LOGS_DIR / f"{name}_{stamp}.log")
     full_cmd = f"stdbuf -oL -eL {cmd} 2>&1 | tee -a {log_file}"
     subprocess.run(
         f"screen -dmS {name} bash -c '{full_cmd}'",
@@ -163,15 +189,24 @@ def screen_launch(name: str, cmd: str) -> str:
     return log_file
 
 
-def screen_stop(name: str, sig: int = signal.SIGTERM) -> None:
+def screen_stop(name: str, graceful: bool = True) -> None:
+    """Stop a screen session.
+
+    If graceful, send Ctrl+C first, then quit to survivors.
+    Falls back to kill -9 if still alive.
+    """
     if not _session_alive(name):
         return
-    if sig == signal.SIGINT:
+    # Phase 1: Ctrl+C (SIGINT)
+    if graceful:
         _send_ctrl_c(name)
         time.sleep(1)
-        if _session_alive(name):
-            _force_kill(name)
-    else:
+    # Phase 2: quit
+    if _session_alive(name):
+        _screen_quit(name)
+        time.sleep(0.5)
+    # Phase 3: force kill
+    if _session_alive(name):
         _force_kill(name)
 
 
@@ -188,6 +223,17 @@ def screen_stop_all() -> None:
         _force_kill(name)
 
 
+# ANSI escape sequence removal
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\]\d+[^a-z]*\x07')
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub('', text)
+
+
+
+
+
 def screen_read_log(name: str, max_lines: int = 100) -> str:
     info = _get_session(name)
     if not info:
@@ -197,7 +243,7 @@ def screen_read_log(name: str, max_lines: int = 100) -> str:
             f"tail -n {max_lines} {info['log_file']}",
             shell=True, capture_output=True, text=True, timeout=3,
         )
-        return result.stdout or "(empty)"
+        return _strip_ansi(result.stdout) or "(empty)"
     except FileNotFoundError:
         return "(log file not found)"
     except Exception as e:
@@ -209,9 +255,12 @@ def screen_read_log_full(name: str) -> str:
     if not info:
         return ""
     try:
-        return Path(info["log_file"]).read_text()
+        return _strip_ansi(Path(info["log_file"]).read_text())
     except FileNotFoundError:
         return ""
+
+
+
 
 
 _init_sessions()
@@ -228,6 +277,10 @@ def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
             capture_output=True, text=True, timeout=timeout,
         )
         return result.stdout.strip()
+    except subprocess.TimeoutExpired as e:
+        if e.stdout:
+            return e.stdout.decode('utf-8').strip() if isinstance(e.stdout, bytes) else e.stdout.strip()
+        return None
     except Exception:
         return None
 
@@ -247,10 +300,10 @@ def check_node_exists(node_name: str) -> bool:
     return output is not None and node_name in output
 
 
-def get_topic_hz(topic: str, timeout: int = 8) -> float:
+def get_topic_hz(topic: str, timeout: int = 2) -> float:
     output = run_ros2_cmd(
-        f"ros2 topic hz {topic} --window 3 --timeout {timeout}",
-        timeout=timeout + 5,
+        f"ros2 topic hz {topic} --window 2 --timeout {timeout}",
+        timeout=timeout + 2,
     )
     if not output:
         return 0.0
@@ -269,7 +322,10 @@ def get_topic_hz(topic: str, timeout: int = 8) -> float:
 
 
 def find_bag_dir(bag_name: str) -> str | None:
-    for p in sorted(Path(".").glob(f"{bag_name}_*")):
+    exact = BAGS_DIR / bag_name
+    if exact.is_dir():
+        return str(exact)
+    for p in sorted(BAGS_DIR.glob(f"{bag_name}_*")):
         if p.is_dir():
             return str(p)
     return None
@@ -359,7 +415,6 @@ def _init_state():
         "pgo_last_size": -1,
         "pgo_stable_count": 0,
         "selected_session": KNOWN_SESSIONS[0]["name"],
-        "log_auto_refresh": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -451,6 +506,14 @@ def render_sidebar():
 # ---------------------------------------------------------------------------
 
 
+@st.fragment(run_every=2)
+def _render_log_viewer(session_name: str):
+    """Log viewer as a Streamlit fragment — only this section re-renders."""
+    st.subheader("Log")
+    log_text = screen_read_log(session_name, max_lines=200)
+    st.code(log_text, language="text", height=500)
+
+
 def render_left_panel():
     st.header("Sessions")
 
@@ -479,18 +542,18 @@ def render_left_panel():
         st.caption("Not yet launched")
 
     # Controls
-    ctrl_cols = st.columns(4)
+    ctrl_cols = st.columns(3)
     with ctrl_cols[0]:
-        if st.button("Refresh", key=f"left_refresh_{selected}"):
+        if st.button("Refresh", key=f"left_refresh_{selected}", use_container_width=True):
             st.rerun()
     with ctrl_cols[1]:
         if alive:
-            if st.button("Stop", key=f"left_stop_{selected}", type="primary"):
+            if st.button("Stop", key=f"left_stop_{selected}", type="primary", use_container_width=True):
                 screen_stop(selected)
                 add_message(f"Stopped {selected}")
                 st.rerun()
         else:
-            if st.button("Restart", key=f"left_restart_{selected}"):
+            if st.button("Restart", key=f"left_restart_{selected}", use_container_width=True):
                 result = screen_restart(selected)
                 if result:
                     add_message(f"Restarted {selected}")
@@ -505,22 +568,11 @@ def render_left_panel():
                 file_name=f"{selected}.log",
                 mime="text/plain",
                 key=f"left_dl_{selected}",
+                use_container_width=True,
             )
 
     st.divider()
-
-    # Log viewer
-    st.subheader("Log")
-    auto_refresh = st.checkbox(
-        "Auto-refresh", key="log_auto_refresh",
-    )
-
-    log_text = screen_read_log(selected, max_lines=200)
-    st.code(log_text, language="text", height=500)
-
-    if auto_refresh:
-        time.sleep(2)
-        st.rerun()
+    _render_log_viewer(selected)
 
     # All sessions overview (compact)
     st.divider()
@@ -611,6 +663,9 @@ def render_step1():
             clear_wait_state()
             add_message(f"WARN: No publisher on {LIVOX_TOPIC} after 20s")
             st.rerun()
+        else:
+            time.sleep(1)
+            st.rerun()
 
     # Livox status after launch
     if sub in ("start_nav", "wait_nav", "release_control"):
@@ -645,6 +700,10 @@ def render_step1():
             st.session_state.current_sub = "release_control"
             clear_wait_state()
             add_message(f"WARN: No publisher on {IMU_TOPIC} after 20s")
+            st.rerun()
+        else:
+            time.sleep(1)
+            st.rerun()
             st.rerun()
 
     # nav_bridge status
@@ -716,6 +775,9 @@ def render_step2():
             clear_wait_state()
             add_message("WARN: laser_mapping not detected after 30s")
             st.rerun()
+        else:
+            time.sleep(2)
+            st.rerun()
 
     # SLAM status
     if sub in ("start_bag", "navigate"):
@@ -730,11 +792,12 @@ def render_step2():
             f"**Start recording** `{LIVOX_TOPIC}` and `{IMU_TOPIC}` to bag `{bag_name}`."
         )
         if st.button("Start Recording", type="primary", key="btn_s2_bag"):
-            add_message(f"Recording bag '{bag_name}'...")
-            cmd = f"ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
+            BAGS_DIR.mkdir(parents=True, exist_ok=True)
+            add_message(f"Recording bag '{bag_name}' in ~/bags ...")
+            cmd = f"cd {BAGS_DIR} && ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
             screen_launch("bag_rec", cmd)
             st.session_state.current_sub = "navigate"
-            add_message(f"Recording to {bag_name}/")
+            add_message(f"Recording to {BAGS_DIR}/{bag_name}/")
             st.rerun()
 
     # Navigate
@@ -760,7 +823,7 @@ def render_step2():
             screen_stop("bag_rec")
             add_message("Bag recording stopped")
             add_message("Stopping SLAM (SIGINT for PGO output)...")
-            screen_stop("slam", signal.SIGINT)
+            screen_stop("slam", graceful=True)
             st.session_state.current_sub = "wait_pgo"
             st.session_state.wait_start = time.monotonic()
             st.rerun()
@@ -854,10 +917,16 @@ def render_step3():
 
     # Start relocalization
     if sub == "start_relocal":
-        st.markdown("**Start the relocalization node** with the prior map.")
+        st.markdown("**Stop live sensor nodes and start relocalization** with the prior map.")
         relocal_cmd = RELOCAL_LAUNCH_CMD.format(prior=map_name)
         st.code(relocal_cmd)
         if st.button("Start Relocalization", type="primary", key="btn_s3_relocal"):
+            if _session_alive("livox"):
+                screen_stop("livox")
+                add_message("Stopped livox")
+            if _session_alive("nav_bridge"):
+                screen_stop("nav_bridge")
+                add_message("Stopped nav_bridge")
             add_message(f"Starting relocalization with prior='{map_name}'...")
             screen_launch("relocal", relocal_cmd)
             st.session_state.current_sub = "wait_relocal"
@@ -878,6 +947,9 @@ def render_step3():
             st.session_state.current_sub = "start_grid"
             clear_wait_state()
             add_message("WARN: laser_mapping not detected after 30s")
+            st.rerun()
+        else:
+            time.sleep(2)
             st.rerun()
 
     # Relocal status
@@ -911,10 +983,10 @@ def render_step3():
     if sub == "start_playback":
         if bag_dir:
             st.markdown(f"**Play the recorded bag** with `--clock`.")
-            st.code(f"ros2 bag play {bag_dir}/ --clock")
+            st.code(f"ros2 bag play {bag_dir} --clock")
             if st.button("Start Playback", type="primary", key="btn_s3_play"):
                 add_message(f"Playing bag '{bag_dir}' with --clock...")
-                cmd = f"ros2 bag play {bag_dir}/ --clock"
+                cmd = f"ros2 bag play {bag_dir} --clock"
                 screen_launch("bag_play", cmd)
                 st.session_state.current_sub = "wait_playback"
                 st.rerun()
@@ -1076,6 +1148,9 @@ def render_step4():
 
         if st.button("Reset Workflow", type="primary", key="btn_s4_reset"):
             screen_stop_all()
+            if LOGS_DIR.exists():
+                shutil.rmtree(LOGS_DIR, ignore_errors=True)
+                LOGS_DIR.mkdir(parents=True, exist_ok=True)
             # Reset only workflow state, keep sessions registry
             workflow_keys = [
                 "current_step", "current_sub", "map_name", "bag_name",
@@ -1107,16 +1182,18 @@ def main():
         render_messages()
         st.divider()
 
-        step_renderers = {
-            0: render_step0,
-            1: render_step1,
-            2: render_step2,
-            3: render_step3,
-            4: render_step4,
-        }
-        renderer = step_renderers.get(st.session_state.current_step)
-        if renderer:
-            renderer()
+        step_placeholder = st.empty()
+        with step_placeholder.container():
+            step_renderers = {
+                0: render_step0,
+                1: render_step1,
+                2: render_step2,
+                3: render_step3,
+                4: render_step4,
+            }
+            renderer = step_renderers.get(st.session_state.current_step)
+            if renderer:
+                renderer()
 
 
 if __name__ == "__main__":

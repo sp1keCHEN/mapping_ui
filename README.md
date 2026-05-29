@@ -22,6 +22,16 @@ uv run streamlit run app.py --server.port 8501
 | **Step 3** 栅格地图构建（离线） | 启动重定位 + gridmapper，回放 bag，自动重命名并部署地图文件 |
 | **Step 4** 完成清理 | 停止残留传感器节点，一键重置工作流 |
 
+## 界面布局
+
+页面分为三栏：**侧边栏** | **左栏（Sessions）** | **右栏（Workflow）**
+
+| 区域 | 内容 |
+|------|------|
+| **侧边栏** | 步骤进度、File Paths（折叠面板）、Abort Mapping（一键停止） |
+| **左栏** | Session 下拉选择 → 状态 + 控制按钮（Stop / Restart / DL Log）→ 日志查看器（auto-refresh 开关）→ 所有 Session 运行状态概览 |
+| **右栏** | 当前步骤消息面板、指令和操作按钮。流程线性推进，无需频繁切页 |
+
 ## 详细交互流程
 
 ### Step 0 初始化
@@ -30,12 +40,11 @@ uv run streamlit run app.py --server.port 8501
 
 ### Step 1 传感器数据获取
 
-| # | 操作 | 说明 |
-|---|------|------|
-| 1 | 点击 "Start Livox Lidar" | 自动等待 `/livox/lidar` topic 有发布者(20s)，显示频率 |
-| 2 | 点击 "Start nav_bridge" | 自动等待 `/imu/data` topic 有发布者(20s)，显示频率 |
-| 3 | 点击 "Release Control" | 调用服务释放遥控器控制 |
-| 4 | 点击 "Continue to Step 2" | 确认传感器正常后进入下一步 |
+每个操作自动等待完成后进入下一个指令，无需手动 "Continue"：
+
+1. **Start Livox Lidar** → 自动等待 `/livox/lidar` topic 有发布者（20s 超时），显示频率
+2. **Start nav_bridge** → 自动等待 `/imu/data` topic 有发布者（20s 超时），显示频率
+3. **Release Control** → 调用服务释放遥控器控制 → 自动进入 Step 2
 
 ### Step 2 三维点云地图构建
 
@@ -43,33 +52,30 @@ uv run streamlit run app.py --server.port 8501
 |---|------|------|
 | 1 | 输入地图名 | 默认 `sensor_YYMMDD_HHMM` |
 | 2 | 遥控站立 → 点击 "Robot is Standing" | |
-| 3 | 点击 "Start SLAM + Rviz" | 自动等待 `laser_mapping` 节点出现(30s) |
+| 3 | 点击 "Start SLAM + Rviz" | 自动等待 `laser_mapping` 节点出现（30s 超时） |
 | 4 | 点击 "Start Recording" | 录制 `/livox/lidar` + `/imu/data` |
-| 5 | 遥控行走建图 → 点击 "Mapping Complete" | 观察 Rviz 回环 |
-| 6 | 点击 "Confirm Stop Bag" → "Confirm Stop SLAM" | 分两步确认，SLAM 收到 SIGINT 后输出 PGO 结果 |
-| 7 | 等待 PGO 文件生成 | 自动检测 `PGO.pcd` + `keyframes/` 出现且大小稳定(最长120s) |
-| 8 | 点击复制按钮 | `PGO.pcd` + `keyframes/` → `prior/<map_name>/` |
-| 9 | 点击 "Continue to Step 3" | 进入栅格地图构建 |
+| 5 | 遥控行走建图 → 点击 "Mapping Complete" | 一键触发：停止 bag 录制 → SIGINT 停止 SLAM → 等待 PGO 输出 |
+| 6 | 等待 PGO 文件生成 | 自动检测 `PGO.pcd` + `keyframes/` 出现且大小稳定（最长 120s） |
+| 7 | 点击复制按钮 | `PGO.pcd` + `keyframes/` → `prior/<map_name>/` → 自动进入 Step 3 |
 
 ### Step 3 栅格地图构建（离线）
 
 | # | 操作 | 说明 |
 |---|------|------|
-| 1 | 点击 "Start Relocalization" | `prior_dir=<map_name>`，等待 `laser_mapping` 节点 |
-| 2 | 点击 "Start Grid Mapper" | |
-| 3 | Rviz 加载 → 点击 "Rviz Ready" | |
-| 4 | 点击 "Start Playback" | `ros2 bag play --clock`，自动检测播放完成，也可手动跳过 |
-| 5 | 观察栅格地图 → 点击 "Stop All Nodes" | |
-| 6 | 检查输出文件 | gridmapper 初始输出为 `map.png / map.yaml / map_connections.txt`，页面标记 `[OK] / [MISSING]` |
-| 7 | 点击 "Proceed to Rename" → "Rename" | 将 `map.*` 重命名为 `<map_name>.*`，更新 yaml 内 image 路径 |
-| 8 | GIMP 编辑 → 点击 "Map Looks Good" | **不可修改分辨率** |
-| 9 | 点击复制到 maps/ | 部署到 `multi_map_nav_ros2/maps/` |
-| 10 | "Rebuild Now" 或 "Skip Rebuild" | 重新编译导航模块 |
+| 1 | 点击 "Start Relocalization" | `prior_dir=<map_name>`，自动等待 `laser_mapping` 节点 |
+| 2 | 点击 "Start Grid Mapper" | 等待 Rviz 加载 → "Rviz Ready" |
+| 3 | 点击 "Start Playback" | `ros2 bag play --clock`，自动检测播放完成，也可 "Skip Playback Wait" 跳过 |
+| 4 | 观察栅格地图 → 点击 "Stop All Nodes" | |
+| 5 | 检查输出文件 | `map.png / map.yaml / map_connections.txt`，标记 OK / MISSING |
+| 6 | 点击 "Proceed to Rename" → "Rename" | 将 `map.*` 重命名为 `<map_name>.*`，更新 yaml 内 image 路径 |
+| 7 | GIMP 编辑 → 点击 "Map Looks Good" | **不可修改分辨率** |
+| 8 | 点击复制到 maps/ | 部署到 `multi_map_nav_ros2/maps/` |
+| 9 | "Rebuild Now" 或 "Skip Rebuild" | 重新编译导航模块 |
 
 ### Step 4 完成清理
 
 显示当前仍在运行的 session，点击 **"Stop All Remaining Sessions"** 一键停止。
-点击 **"Reset Workflow"** 可回到 Step 0 重新开始。
+点击 **"Reset Workflow"** 回到 Step 0 重新开始。
 
 ## 工作原理
 
@@ -78,21 +84,24 @@ uv run streamlit run app.py --server.port 8501
 - `ros2 node list` — 检查节点是否启动
 - `ros2 topic info` — 检查 topic 是否有发布者
 - `ros2 topic hz` — 显示数据频率
-- bag 回放完成检测 — 进程退出自动检测，或手动 "Skip to Next" 跳过
+- bag 回放完成检测 — 进程退出自动检测，或手动跳过
 - PGO 文件就绪检测 — 文件出现且大小连续 3 次检查不变才确认
-- Launch 时同名 screen session 已存在会自动清理，不会重名
+- Launch 时同名 screen session 已存在会自动清理
+- Session 注册表和 workflow 状态存储在 `st.session_state` 中，页面刷新不丢失
 
-## 界面布局
+### Session 停止逻辑
 
-| 区域 | 内容 |
-|------|------|
-| **侧边栏** | 工作流步骤进度、Session 管理面板（Stop All / Log / Stop / Restart / Refresh）、**Abort Mapping**（一键停止所有节点并回到 Step 0）、实时日志查看器 |
-| **主区域** | Step Messages 时间戳消息面板（可折叠）、当前步骤详情和操作按钮 |
-| **底部** | **File Paths** 折叠面板（显示所有读写路径）、Live Log 折叠面板（Refresh / Download Log） |
+参考 `navigate.sh` 的两阶段停止策略：
+
+1. **Phase 1** — 通过 `screen -X stuff '^C'` 发送 Ctrl+C（SIGINT）
+2. **Phase 2** — `screen -X quit` 终止仍存活的 session
+3. **Phase 3** — `kill -9 {PID}` 强制杀死仍未退出的进程
+
+screen 名称匹配使用 `.{name}[[:space:]]` 模式，避免同名前缀冲突（如 `livox` 不会匹配 `livox_backup`）。
 
 ## Screen 会话管理
 
-每个后台进程分配一个命名 screen 会话，可在侧边栏直接管理：
+左栏 Session 面板独立于 workflow，可随时查看/停止/重启任意 session：
 
 | 会话名 | 对应节点 |
 |--------|----------|
