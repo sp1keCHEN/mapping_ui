@@ -19,10 +19,16 @@ from pathlib import Path
 
 import streamlit as st
 
+from i18n import TRANSLATIONS, t
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Mapping Scripts", layout="wide")
+
+# Language selector — must be before any t() call
+if "lang" not in st.session_state:
+    st.session_state.lang = "en"
 
 # ---------------------------------------------------------------------------
 # Path constants
@@ -428,13 +434,14 @@ def copy_pgo_to_prior(map_name: str) -> list[str]:
 # Workflow state
 # ---------------------------------------------------------------------------
 
-STEP_DEFS = [
-    {"id": 0, "name": "Init"},
-    {"id": 1, "name": "Sensor Setup"},
-    {"id": 2, "name": "PGO SLAM"},
-    {"id": 3, "name": "Grid Map"},
-    {"id": 4, "name": "Complete"},
-]
+def _step_defs():
+    return [
+        {"id": 0, "name": t("step0_name")},
+        {"id": 1, "name": t("step1_name")},
+        {"id": 2, "name": t("step2_name")},
+        {"id": 3, "name": t("step3_name")},
+        {"id": 4, "name": t("step4_name")},
+    ]
 
 
 def _init_state():
@@ -501,9 +508,26 @@ def step_status(step_id: int) -> str:
 
 
 def render_sidebar():
-    st.sidebar.title("Mapping")
+    st.sidebar.title(t("sidebar_title"))
 
-    for sdef in STEP_DEFS:
+    # Language toggle
+    lang_options = {"en": "English", "zh": "中文"}
+    current_lang = st.session_state.lang
+    selected_lang = st.sidebar.radio(
+        "🌐 Language",
+        options=list(lang_options.keys()),
+        format_func=lambda k: lang_options[k],
+        index=list(lang_options.keys()).index(current_lang),
+        horizontal=True,
+        key="lang_radio",
+    )
+    if selected_lang != current_lang:
+        st.session_state.lang = selected_lang
+        st.rerun()
+
+    st.sidebar.divider()
+
+    for sdef in _step_defs():
         sid = sdef["id"]
         status = step_status(sid)
         if status == "done":
@@ -515,7 +539,7 @@ def render_sidebar():
 
     st.sidebar.divider()
 
-    with st.sidebar.expander("File Paths", expanded=False):
+    with st.sidebar.expander(t("file_paths"), expanded=False):
         mn = st.session_state.map_name or "(TBD)"
         bd = st.session_state.bag_dir or "(TBD)"
         st.markdown(
@@ -528,9 +552,9 @@ def render_sidebar():
 
     if 0 < st.session_state.current_step < 4:
         st.sidebar.divider()
-        if st.sidebar.button("Abort Mapping", type="primary", key="sidebar_abort"):
+        if st.sidebar.button(t("abort_mapping"), type="primary", key="sidebar_abort"):
             screen_stop_all()
-            add_message("ABORT: All sessions stopped")
+            add_message(t("abort_done"))
             st.session_state.current_step = 0
             st.session_state.current_sub = "start"
             st.rerun()
@@ -566,13 +590,13 @@ def _list_screen_sessions() -> list[str]:
 @st.fragment(run_every=2)
 def _render_log_viewer(session_name: str):
     """Log viewer as a Streamlit fragment — only this section re-renders."""
-    st.subheader("Log")
+    st.subheader(t("log"))
     log_text = screen_read_log(session_name, max_lines=200)
     st.code(log_text, language="text", height=500)
 
 
 def render_left_panel():
-    st.header("Sessions")
+    st.header(t("sessions"))
 
     # Build session list: known sessions + any live ones not in the known list
     live_sessions = _list_screen_sessions()
@@ -586,7 +610,7 @@ def render_left_panel():
     if st.session_state.selected_session in all_names:
         default_idx = all_names.index(st.session_state.selected_session)
     selected = st.selectbox(
-        "Select session",
+        t("select_session"),
         options=all_names,
         index=default_idx,
         format_func=lambda n: SESSION_LABEL.get(n, n),
@@ -598,27 +622,27 @@ def render_left_panel():
     info = _get_session(selected)
 
     status_icon = "&#9989;" if alive else "&#9760;"
-    st.markdown(f"**Status:** {status_icon} {'running' if alive else 'stopped'}")
+    st.markdown(f"**{t('status')}:** {status_icon} {t('running') if alive else t('stopped')}")
 
     if info:
         st.caption(f"Command: `{info['cmd']}`")
         st.caption(f"Log: `{info['log_file']}`")
     else:
-        st.caption("Not yet launched")
+        st.caption(t("not_launched"))
 
     # Controls
     ctrl_cols = st.columns(3)
     with ctrl_cols[0]:
-        if st.button("Refresh", key=f"left_refresh_{selected}", use_container_width=True):
+        if st.button(t("refresh"), key=f"left_refresh_{selected}", use_container_width=True):
             st.rerun()
     with ctrl_cols[1]:
         if alive:
-            if st.button("Stop", key=f"left_stop_{selected}", type="primary", use_container_width=True):
+            if st.button(t("stop"), key=f"left_stop_{selected}", type="primary", use_container_width=True):
                 screen_stop(selected)
                 add_message(f"Stopped {selected}")
                 st.rerun()
         else:
-            if st.button("Restart", key=f"left_restart_{selected}", use_container_width=True):
+            if st.button(t("restart"), key=f"left_restart_{selected}", use_container_width=True):
                 result = screen_restart(selected)
                 if result:
                     add_message(f"Restarted {selected}")
@@ -641,13 +665,13 @@ def render_left_panel():
 
     # All sessions overview — live from screen -ls
     st.divider()
-    st.subheader("All Sessions")
+    st.subheader(t("all_sessions"))
     if live_sessions:
         for name in live_sessions:
             label = SESSION_LABEL.get(name, name)
             st.markdown(f"🟢 **{label}** (running)")
     else:
-        st.caption("No active screen sessions")
+        st.caption(t("no_active"))
 
 # ---------------------------------------------------------------------------
 # RIGHT PANEL - Mapping workflow
@@ -656,40 +680,57 @@ def render_left_panel():
 
 def render_messages():
     messages = st.session_state.step_messages
-    if messages:
-        with st.expander("Messages", expanded=True):
-            for msg in messages:
-                if "ERROR" in msg:
-                    st.error(msg)
-                elif "WARN" in msg:
-                    st.warning(msg)
-                elif any(kw in msg for kw in ("OK", "Copied", "Renamed", "ready")):
-                    st.success(msg)
-                else:
-                    st.text(msg)
+    if not messages:
+        return
+
+    st.markdown(f"**{t('messages')}**")
+
+    # Build message HTML
+    lines: list[str] = []
+    for msg in messages:
+        if "ERROR" in msg:
+            color = "#ff4b4b"
+        elif "WARN" in msg:
+            color = "#ffa726"
+        elif any(kw in msg for kw in ("OK", "Copied", "Renamed", "ready")):
+            color = "#66bb6a"
+        else:
+            color = "#ccc"
+        escaped = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines.append(f'<div style="color:{color};padding:2px 0;font-size:13px;font-family:monospace">{escaped}</div>')
+
+    html_content = "\n".join(lines)
+    # Fixed-height scrollable container that auto-scrolls to bottom
+    st.components.v1.html(f"""
+    <div id="msg-box" style="
+        height: 200px;
+        overflow-y: auto;
+        background: #1a1a2e;
+        border-radius: 6px;
+        padding: 8px 12px;
+        border: 1px solid #333;
+    ">
+        {html_content}
+    </div>
+    <script>
+        var box = document.getElementById('msg-box');
+        box.scrollTop = box.scrollHeight;
+    </script>
+    """, height=230)
 
 
 def render_step0():
-    st.header("Step 0: Initialization")
+    st.header(t("s0_header"))
 
     setup_path = ALGOR_WS_ROOT / "install" / "setup.bash"
     ws_info = f"Workspace: `{ALGOR_WS_ROOT}`\nROS_DISTRO: `{ROS2_ENV.get('ROS_DISTRO', 'N/A')}`"
     if not setup_path.exists():
-        st.warning("install/setup.bash not found. Source it or rebuild first.")
+        st.warning(t("s0_setup_missing"))
     st.info(ws_info)
 
-    st.markdown(
-        """
-        This tool guides you through the full mapping workflow:
+    st.markdown(t("s0_desc"))
 
-        1. **Sensor Setup** - Start Livox Lidar and nav_bridge IMU
-        2. **PGO SLAM** - 3D pointcloud map construction
-        3. **Grid Map** - Offline grid map from bag playback
-        4. **Complete** - Cleanup and finish
-        """
-    )
-
-    if st.button("Start Workflow", type="primary", key="btn_step0_start"):
+    if st.button(t("start_workflow"), type="primary", key="btn_step0_start"):
         st.session_state.current_step = 1
         st.session_state.current_sub = "start_livox"
         st.session_state.step_messages = []
@@ -697,13 +738,13 @@ def render_step0():
 
 
 def render_step1():
-    st.header("Step 1: Sensor Data Acquisition")
+    st.header(t("s1_header"))
     sub = st.session_state.current_sub
 
     # Start Livox
     if sub == "start_livox":
-        st.markdown("**Start the Livox lidar node.**")
-        if st.button("Start Livox Lidar", type="primary", key="btn_s1_livox"):
+        st.markdown(t("s1_start_livox_desc"))
+        if st.button(t("s1_start_livox"), type="primary", key="btn_s1_livox"):
             add_message("Starting Livox lidar...")
             screen_launch("livox", LIVOX_LAUNCH_CMD)
             st.session_state.current_sub = "wait_livox"
@@ -739,8 +780,8 @@ def render_step1():
 
     # Start nav_bridge
     if sub == "start_nav":
-        st.markdown("**Start the nav_bridge IMU node.**")
-        if st.button("Start nav_bridge", type="primary", key="btn_s1_nav"):
+        st.markdown(t("s1_start_nav_desc"))
+        if st.button(t("s1_start_nav"), type="primary", key="btn_s1_nav"):
             add_message("Starting nav_bridge for IMU...")
             screen_launch("nav_bridge", NAV_BRIDGE_LAUNCH_CMD)
             st.session_state.current_sub = "wait_nav"
@@ -776,8 +817,8 @@ def render_step1():
 
     # Release control
     if sub == "release_control":
-        st.markdown("**Release remote control so the robot accepts commands.**")
-        if st.button("Release Control", type="primary", key="btn_s1_release"):
+        st.markdown(t("s1_release_desc"))
+        if st.button(t("s1_release"), type="primary", key="btn_s1_release"):
             add_message("Calling /nav_bridge_node/release_control...")
             output = run_ros2_cmd(
                 "ros2 service call /nav_bridge_node/release_control std_srvs/srv/Trigger"
@@ -792,30 +833,27 @@ def render_step1():
 
 
 def render_step2():
-    st.header("Step 2: PGO SLAM - 3D Pointcloud Map")
+    st.header(t("s2_header"))
     sub = st.session_state.current_sub
 
     # Map name
     map_name = st.text_input(
-        "Map name", value=st.session_state.map_name, key="map_name_input",
+        t("s2_map_name"), value=st.session_state.map_name, key="map_name_input",
     )
     st.session_state.map_name = map_name
 
     # Stand up
     if sub == "stand_up":
-        st.markdown(
-            "**Use the remote controller to stand up the robot.** "
-            "Once standing, click below."
-        )
-        if st.button("Robot is Standing", type="primary", key="btn_s2_stand"):
+        st.markdown(t("s2_stand_desc"))
+        if st.button(t("s2_stand_btn"), type="primary", key="btn_s2_stand"):
             add_message("Robot is standing")
             st.session_state.current_sub = "start_slam"
             st.rerun()
 
     # Start SLAM
     if sub == "start_slam":
-        st.markdown("**Start the SLAM node with PGO + Rviz.**")
-        if st.button("Start SLAM + Rviz", type="primary", key="btn_s2_slam"):
+        st.markdown(t("s2_start_slam_desc"))
+        if st.button(t("s2_start_slam"), type="primary", key="btn_s2_slam"):
             add_message("Starting SLAM with PGO + Rviz...")
             screen_launch("slam", SLAM_PGO_LAUNCH_CMD)
             st.session_state.current_sub = "wait_slam"
@@ -853,7 +891,7 @@ def render_step2():
         st.markdown(
             f"**Start recording** `{LIVOX_TOPIC}` and `{IMU_TOPIC}` to bag `{bag_name}`."
         )
-        if st.button("Start Recording", type="primary", key="btn_s2_bag"):
+        if st.button(t("s2_start_rec"), type="primary", key="btn_s2_bag"):
             BAGS_DIR.mkdir(parents=True, exist_ok=True)
             add_message(f"Recording bag '{bag_name}' in ~/bags ...")
             cmd = f"ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
@@ -872,15 +910,9 @@ def render_step2():
         with c2:
             st.markdown(f"**Bag recording:** {'running' if rec_alive else 'stopped'}")
 
-        st.markdown(
-            """
-            **Drive the robot** through the scene with the remote controller.
-            - Watch Rviz for loop closures and map quality
-            - Keep dynamic objects out of the robot's frontal view
-            """
-        )
+        st.markdown(t("s2_navigate_desc"))
 
-        if st.button("Mapping Complete", type="primary", key="btn_s2_done"):
+        if st.button(t("s2_mapping_done"), type="primary", key="btn_s2_done"):
             add_message("Mapping complete - stopping bag recording...")
             screen_stop("bag_rec")
             add_message("Bag recording stopped")
@@ -970,7 +1002,7 @@ def render_step2():
 
 
 def render_step3():
-    st.header("Step 3: Grid Map Construction (Offline)")
+    st.header(t("s3_header"))
     sub = st.session_state.current_sub
     map_name = st.session_state.map_name
     bag_dir = st.session_state.bag_dir
@@ -1234,7 +1266,7 @@ def render_step3():
 
 
 def render_step4():
-    st.header("Workflow Complete")
+    st.header(t("s4_header"))
     sub = st.session_state.current_sub
 
     if sub == "cleanup":
@@ -1255,9 +1287,9 @@ def render_step4():
             st.rerun()
 
     if sub == "done":
-        st.markdown("**All mapping steps are done.**")
+        st.markdown(t("s4_all_done"))
 
-        if st.button("Reset Workflow", type="primary", key="btn_s4_reset"):
+        if st.button(t("s4_reset"), type="primary", key="btn_s4_reset"):
             screen_stop_all()
             if LOGS_DIR.exists():
                 shutil.rmtree(LOGS_DIR, ignore_errors=True)
@@ -1281,8 +1313,40 @@ def render_step4():
 
 
 def main():
-    st.title("Mapping Scripts")
+    st.title(t("page_title"))
     render_sidebar()
+
+    # --- Browser-level refresh guard while workflow is active ---
+    if 0 < st.session_state.current_step < 4:
+        st.components.v1.html("""
+        <script>
+        window.addEventListener('beforeunload', function(e) {
+            e.preventDefault();
+            e.returnValue = '';
+        });
+        </script>
+        """, height=0)
+
+    # --- In-page warning: detect stale sessions on fresh page load ---
+    if st.session_state.current_step == 0:
+        live = _list_screen_sessions()
+        known_live = [n for n in live if n in SESSION_NAMES]
+        if known_live and "refresh_dismissed" not in st.session_state:
+            st.error(t("refresh_warn_title"))
+            st.markdown(t("refresh_warn_body"))
+            st.markdown(f"**{', '.join(known_live)}**")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(t("stop_all_restart"), type="primary", key="btn_refresh_stop"):
+                    for name in known_live:
+                        _force_kill(name)
+                    st.session_state.refresh_dismissed = True
+                    st.rerun()
+            with c2:
+                if st.button(t("dismiss"), key="btn_refresh_dismiss"):
+                    st.session_state.refresh_dismissed = True
+                    st.rerun()
+            return  # Don't render the workflow until user decides
 
     left_col, right_col = st.columns([1, 2])
 
@@ -1290,9 +1354,6 @@ def main():
         render_left_panel()
 
     with right_col:
-        render_messages()
-        st.divider()
-
         step_placeholder = st.empty()
         with step_placeholder.container():
             step_renderers = {
@@ -1305,6 +1366,9 @@ def main():
             renderer = step_renderers.get(st.session_state.current_step)
             if renderer:
                 renderer()
+
+        st.divider()
+        render_messages()
 
 
 if __name__ == "__main__":
