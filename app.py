@@ -54,31 +54,52 @@ IMU_TOPIC = "/imu/data"
 
 
 def _ros2_env() -> dict:
-    env = os.environ.copy()
-    distro = env.get("ROS_DISTRO", "")
+    """Source ROS2 setup files and capture the **full** resulting environment.
+
+    Manually setting PATH/PYTHONPATH alone is insufficient — ROS2 also
+    needs AMENT_PREFIX_PATH, LD_LIBRARY_PATH, COLCON_PREFIX_PATH, etc.
+    The only reliable way is to source setup.bash and harvest ``env``.
+    """
+    setup_cmds: list[str] = []
+
+    # Detect distro
+    distro = os.environ.get("ROS_DISTRO", "")
     if not distro:
         opt_ros = Path("/opt/ros")
         if opt_ros.is_dir():
-            candidates = [d.name for d in opt_ros.iterdir() if d.is_dir()]
+            candidates = sorted(d.name for d in opt_ros.iterdir() if d.is_dir())
             if candidates:
-                distro = candidates[0]
+                distro = candidates[-1]  # pick latest if multiple
     if distro:
-        ros_prefix = f"/opt/ros/{distro}"
-        env["ROS_DISTRO"] = distro
-        env.setdefault("ROS_PACKAGE_PATH", "")
-        env["ROS_PACKAGE_PATH"] = f"{ros_prefix}/share:{env['ROS_PACKAGE_PATH']}"
-        env["PATH"] = f"{ros_prefix}/bin:{env['PATH']}"
-    setup_bash = ALGOR_WS_ROOT / "install" / "setup.bash"
-    if setup_bash.exists():
-        install_prefix = str(ALGOR_WS_ROOT / "install")
-        env.setdefault("ROS_PACKAGE_PATH", "")
-        env["ROS_PACKAGE_PATH"] = f"{install_prefix}/share:{env['ROS_PACKAGE_PATH']}"
-        env["PATH"] = f"{install_prefix}:{env['PATH']}"
-        minor = sys.version_info.minor
-        py_path = f"{install_prefix}/lib/python3.{minor}/site-packages"
-        env.setdefault("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{py_path}:{env['PYTHONPATH']}"
-    return env
+        ros_setup = Path(f"/opt/ros/{distro}/setup.bash")
+        if ros_setup.exists():
+            setup_cmds.append(f"source {ros_setup}")
+
+    ws_setup = ALGOR_WS_ROOT / "install" / "setup.bash"
+    if ws_setup.exists():
+        setup_cmds.append(f"source {ws_setup}")
+
+    if not setup_cmds:
+        return os.environ.copy()
+
+    # Source all setup files, then dump the resulting environment
+    script = " && ".join(setup_cmds) + " && env -0"
+    try:
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        env: dict[str, str] = {}
+        for entry in result.stdout.split("\0"):
+            if "=" in entry:
+                key, _, value = entry.partition("=")
+                env[key] = value
+        if env:
+            return env
+    except Exception:
+        pass
+
+    return os.environ.copy()
 
 
 ROS2_ENV = _ros2_env()
@@ -174,12 +195,17 @@ def _send_ctrl_c(name: str) -> None:
         pass
 
 
-def screen_launch(name: str, cmd: str) -> str:
+def screen_launch(name: str, cmd: str, cwd: str | None = None) -> str:
     _force_kill(name)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = str(LOGS_DIR / f"{name}_{stamp}.log")
-    full_cmd = f"stdbuf -oL -eL {cmd} 2>&1 | tee -a {log_file}"
+    stdbuf_cmd = f"stdbuf -oL -eL {cmd} 2>&1 | tee -a {log_file}"
+    if cwd:
+        # cd first, then run the stdbuf-wrapped command
+        full_cmd = f"cd {cwd} && {stdbuf_cmd}"
+    else:
+        full_cmd = stdbuf_cmd
     subprocess.run(
         f"screen -dmS {name} bash -c '{full_cmd}'",
         shell=True, env=ROS2_ENV,
@@ -286,12 +312,18 @@ def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
 
 
 def check_topic_publishers(topic: str) -> int:
-    output = run_ros2_cmd(f"ros2 topic info {topic} --no-arr")
+    output = run_ros2_cmd(f"ros2 topic info {topic}")
     if not output:
         return -1
     for line in output.splitlines():
-        if "Publisher count:" in line:
-            return int(line.split(":")[1].strip())
+        # Humble: "Publisher count: 1"  /  Jazzy: "Publisher count: 1"
+        if "publisher" in line.lower() and "count" in line.lower():
+            parts = line.split(":")
+            if len(parts) >= 2:
+                try:
+                    return int(parts[-1].strip())
+                except ValueError:
+                    pass
     return 0
 
 
@@ -300,10 +332,12 @@ def check_node_exists(node_name: str) -> bool:
     return output is not None and node_name in output
 
 
-def get_topic_hz(topic: str, timeout: int = 2) -> float:
+def get_topic_hz(topic: str, timeout: int = 3) -> float:
+    """Get topic publish rate. Jazzy has no --timeout flag, so we rely
+    on subprocess timeout to kill the process after *timeout* seconds."""
     output = run_ros2_cmd(
-        f"ros2 topic hz {topic} --window 2 --timeout {timeout}",
-        timeout=timeout + 2,
+        f"ros2 topic hz {topic} --window 3",
+        timeout=timeout,
     )
     if not output:
         return 0.0
@@ -344,9 +378,10 @@ def rename_grid_map(old_name: str, new_name: str) -> list[str]:
     yaml_path = GRIDMAPPER_OUTPUT / f"{new_name}.yaml"
     if yaml_path.exists():
         content = yaml_path.read_text()
+        # Replace whatever image filename is in the yaml with the new name
         fixed = re.sub(
-            r"(image:\s*['\"]?)\./?" + re.escape(old_name) + r"\.png(['\"]?)",
-            r"\1" + new_name + ".png\2",
+            r"(image:\s*)[^\s#]+",
+            r"\g<1>" + new_name + ".png",
             content,
         )
         if fixed != content:
@@ -501,9 +536,31 @@ def render_sidebar():
             st.rerun()
 
 
+
+
 # ---------------------------------------------------------------------------
 # LEFT PANEL - Session management (independent of workflow)
 # ---------------------------------------------------------------------------
+
+
+def _list_screen_sessions() -> list[str]:
+    """Return names of currently active screen sessions via `screen -ls`."""
+    try:
+        result = subprocess.run(
+            "screen -ls", shell=True, capture_output=True, text=True, timeout=5,
+        )
+        names: list[str] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            # Lines look like: "12345.slam	(05/29/26 17:00:00)	(Detached)"
+            if "." in line and ("Detached" in line or "Attached" in line):
+                # Extract the name after the PID dot
+                part = line.split("\t")[0]   # "12345.slam"
+                name = part.split(".", 1)[1] if "." in part else part
+                names.append(name)
+        return names
+    except Exception:
+        return []
 
 
 @st.fragment(run_every=2)
@@ -517,13 +574,21 @@ def _render_log_viewer(session_name: str):
 def render_left_panel():
     st.header("Sessions")
 
+    # Build session list: known sessions + any live ones not in the known list
+    live_sessions = _list_screen_sessions()
+    all_names = list(SESSION_NAMES)  # start with known
+    for name in live_sessions:
+        if name not in all_names:
+            all_names.append(name)
+
     # Session selector
+    default_idx = 0
+    if st.session_state.selected_session in all_names:
+        default_idx = all_names.index(st.session_state.selected_session)
     selected = st.selectbox(
         "Select session",
-        options=SESSION_NAMES,
-        index=SESSION_NAMES.index(
-            st.session_state.selected_session
-        ) if st.session_state.selected_session in SESSION_NAMES else 0,
+        options=all_names,
+        index=default_idx,
         format_func=lambda n: SESSION_LABEL.get(n, n),
     )
     st.session_state.selected_session = selected
@@ -574,15 +639,15 @@ def render_left_panel():
     st.divider()
     _render_log_viewer(selected)
 
-    # All sessions overview (compact)
+    # All sessions overview — live from screen -ls
     st.divider()
     st.subheader("All Sessions")
-    for sess in KNOWN_SESSIONS:
-        name = sess["name"]
-        a = _session_alive(name)
-        icon = "+" if a else "o"
-        st.markdown(f"{icon} **{sess['label']}** {'(running)' if a else ''}")
-
+    if live_sessions:
+        for name in live_sessions:
+            label = SESSION_LABEL.get(name, name)
+            st.markdown(f"🟢 **{label}** (running)")
+    else:
+        st.caption("No active screen sessions")
 
 # ---------------------------------------------------------------------------
 # RIGHT PANEL - Mapping workflow
@@ -648,23 +713,22 @@ def render_step1():
     if sub == "wait_livox":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / 20, 1.0))
-        st.caption(f"Waiting for {LIVOX_TOPIC} publisher... ({elapsed:.0f}s / 20s)")
+        st.caption(f"Waiting for {LIVOX_TOPIC} data... ({elapsed:.0f}s / 20s)")
 
-        pub_count = check_topic_publishers(LIVOX_TOPIC)
-        if pub_count > 0:
-            hz = get_topic_hz(LIVOX_TOPIC)
+        hz = get_topic_hz(LIVOX_TOPIC)
+        if hz > 0:
             st.session_state.step1_livox_hz = hz
             st.session_state.current_sub = "start_nav"
             clear_wait_state()
-            add_message(f"{LIVOX_TOPIC} active ({pub_count} publishers, ~{hz:.1f} Hz)")
+            add_message(f"{LIVOX_TOPIC} active (~{hz:.1f} Hz)")
             st.rerun()
         elif elapsed >= 20:
             st.session_state.current_sub = "start_nav"
             clear_wait_state()
-            add_message(f"WARN: No publisher on {LIVOX_TOPIC} after 20s")
+            add_message(f"WARN: No data on {LIVOX_TOPIC} after 20s")
             st.rerun()
         else:
-            time.sleep(1)
+            time.sleep(2)
             st.rerun()
 
     # Livox status after launch
@@ -686,24 +750,22 @@ def render_step1():
     if sub == "wait_nav":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / 20, 1.0))
-        st.caption(f"Waiting for {IMU_TOPIC} publisher... ({elapsed:.0f}s / 20s)")
+        st.caption(f"Waiting for {IMU_TOPIC} data... ({elapsed:.0f}s / 20s)")
 
-        pub_count = check_topic_publishers(IMU_TOPIC)
-        if pub_count > 0:
-            hz = get_topic_hz(IMU_TOPIC)
+        hz = get_topic_hz(IMU_TOPIC)
+        if hz > 0:
             st.session_state.step1_imu_hz = hz
             st.session_state.current_sub = "release_control"
             clear_wait_state()
-            add_message(f"{IMU_TOPIC} active ({pub_count} publishers, ~{hz:.1f} Hz)")
+            add_message(f"{IMU_TOPIC} active (~{hz:.1f} Hz)")
             st.rerun()
         elif elapsed >= 20:
             st.session_state.current_sub = "release_control"
             clear_wait_state()
-            add_message(f"WARN: No publisher on {IMU_TOPIC} after 20s")
+            add_message(f"WARN: No data on {IMU_TOPIC} after 20s")
             st.rerun()
         else:
-            time.sleep(1)
-            st.rerun()
+            time.sleep(2)
             st.rerun()
 
     # nav_bridge status
@@ -794,8 +856,8 @@ def render_step2():
         if st.button("Start Recording", type="primary", key="btn_s2_bag"):
             BAGS_DIR.mkdir(parents=True, exist_ok=True)
             add_message(f"Recording bag '{bag_name}' in ~/bags ...")
-            cmd = f"cd {BAGS_DIR} && ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
-            screen_launch("bag_rec", cmd)
+            cmd = f"ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
+            screen_launch("bag_rec", cmd, cwd=str(BAGS_DIR))
             st.session_state.current_sub = "navigate"
             add_message(f"Recording to {BAGS_DIR}/{bag_name}/")
             st.rerun()
@@ -1027,15 +1089,59 @@ def render_step3():
     # Stop nodes
     if sub == "stop_nodes":
         st.markdown("**Stopping nodes...**")
-        for name in ("bag_play", "gridmapper", "relocal"):
+
+        # Stop bag_play and relocal immediately (no file output needed)
+        for name in ("bag_play", "relocal"):
             if _session_alive(name):
                 screen_stop(name)
                 add_message(f"Stopped {name}")
-            else:
-                add_message(f"{name} already stopped")
-            st.text(f"{name}: {'stopped' if not _session_alive(name) else 'stopping...'}")
-        st.session_state.current_sub = "check_output"
+
+        # Gracefully stop gridmapper — send SIGINT and wait for it to save
+        if _session_alive("gridmapper"):
+            add_message("Sending SIGINT to gridmapper (saving map files)...")
+            _send_ctrl_c("gridmapper")
+        st.session_state.current_sub = "wait_grid_output"
+        st.session_state.wait_start = time.monotonic()
         st.rerun()
+
+    # Wait for gridmapper to finish saving
+    if sub == "wait_grid_output":
+        elapsed = time.monotonic() - get_wait_start()
+        st.progress(min(elapsed / 30, 1.0))
+        st.caption(f"Waiting for gridmapper to save map files... ({elapsed:.0f}s / 30s)")
+
+        grid_alive = _session_alive("gridmapper")
+        map_png = GRIDMAPPER_OUTPUT / "map.png"
+        map_yaml = GRIDMAPPER_OUTPUT / "map.yaml"
+        files_ready = map_png.exists() and map_yaml.exists()
+
+        if files_ready:
+            # Files appeared — clean up gridmapper if still running
+            if grid_alive:
+                screen_stop("gridmapper")
+            clear_wait_state()
+            add_message("Gridmapper output files ready")
+            st.session_state.current_sub = "check_output"
+            st.rerun()
+        elif not grid_alive:
+            # Gridmapper exited on its own — check if files appeared
+            clear_wait_state()
+            if files_ready:
+                add_message("Gridmapper output files ready")
+            else:
+                add_message("WARN: Gridmapper exited but map files not found")
+            st.session_state.current_sub = "check_output"
+            st.rerun()
+        elif elapsed >= 30:
+            # Timeout — force stop and proceed
+            add_message("WARN: Gridmapper save timeout (30s), force stopping")
+            screen_stop("gridmapper")
+            clear_wait_state()
+            st.session_state.current_sub = "check_output"
+            st.rerun()
+        else:
+            time.sleep(2)
+            st.rerun()
 
     # Check output
     if sub == "check_output":
@@ -1049,6 +1155,7 @@ def render_step3():
             else:
                 st.markdown(f"MISSING - `{f.name}`")
         if map_png.exists():
+            st.image(str(map_png), caption="map.png (generated)", use_container_width=True)
             if st.button("Proceed to Rename", type="primary", key="btn_s3_rename_go"):
                 st.session_state.current_sub = "rename"
                 st.rerun()
@@ -1065,10 +1172,13 @@ def render_step3():
 
     # Review
     if sub == "review":
+        renamed_png = GRIDMAPPER_OUTPUT / f"{map_name}.png"
         st.markdown(
-            f"**Review the map** - open `{map_name}.png` in GIMP if needed.\n\n"
+            f"**Review the map** — open `{map_name}.png` in GIMP if needed.\n\n"
             "**Do NOT change the resolution.**"
         )
+        if renamed_png.exists():
+            st.image(str(renamed_png), caption=f"{map_name}.png", use_container_width=True)
         if st.button("Map Looks Good", type="primary", key="btn_s3_review"):
             st.session_state.current_sub = "copy_maps"
             st.rerun()
@@ -1085,16 +1195,17 @@ def render_step3():
 
     # Rebuild
     if sub == "rebuild":
+        build_cmd = "colcon build --packages-select multi_map_nav --cmake-args -Wno-dev -DCMAKE_EXPORT_COMPILE_COMMANDS=1 --symlink-install"
         st.markdown(
             f"**Rebuild** the navigation module.\n\n"
-            f"`colcon build --packages-select multi_map_nav_ros2`"
+            f"`{build_cmd}`"
         )
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Rebuild Now", type="primary", key="btn_s3_rebuild"):
                 add_message("Running colcon build...")
-                cmd = f"cd {ALGOR_WS_ROOT} && colcon build --packages-select multi_map_nav_ros2 2>&1"
-                screen_launch("build", cmd)
+                cmd = f"{build_cmd} 2>&1"
+                screen_launch("build", cmd, cwd=str(ALGOR_WS_ROOT))
                 st.session_state.current_sub = "wait_build"
                 st.rerun()
         with c2:
