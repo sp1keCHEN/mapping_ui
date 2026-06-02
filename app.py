@@ -332,16 +332,25 @@ _init_sessions()
 
 
 def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
+    import signal
     try:
-        result = subprocess.run(
+        # start_new_session=True creates a new process group.
+        # When timing out, we SIGKILL the entire group to guarantee that no orphaned ROS2 child nodes leak.
+        proc = subprocess.Popen(
             cmd, shell=True, env=ROS2_ENV,
-            capture_output=True, text=True, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True
         )
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired as e:
-        if e.stdout:
-            return e.stdout.decode('utf-8').strip() if isinstance(e.stdout, bytes) else e.stdout.strip()
-        return None
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return stdout.strip()
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            stdout, stderr = proc.communicate()
+            return stdout.strip()
     except Exception:
         return None
 
@@ -399,12 +408,16 @@ def get_monitor_manager():
                     if self.stop_event.is_set():
                         break
 
-                    # 1. Low-overhead pre-check: if no active publishers, rate is 0.0 instantly
+                    # 1. Skip querying if we already have a valid frequency (only need to detect once)
+                    if self.rates[topic] > 0.0:
+                        continue
+
+                    # 2. Low-overhead pre-check: if no active publishers, rate is 0.0 instantly
                     if check_topic_publishers(topic) <= 0:
                         self.rates[topic] = 0.0
                         continue
 
-                    # 2. Only run heavier ros2 topic hz when publisher exists
+                    # 3. Only run heavier ros2 topic hz when publisher exists
                     output = run_ros2_cmd(
                         f"ros2 topic hz {topic} --window 2",
                         timeout=2,
@@ -424,6 +437,10 @@ def get_monitor_manager():
         def get_hz(self, topic):
             self.last_request[topic] = time.monotonic()
             return self.rates.get(topic, 0.0)
+
+        def reset(self):
+            for topic in self.rates:
+                self.rates[topic] = 0.0
 
     return MonitorManager()
 
@@ -535,6 +552,9 @@ def _init_state():
         "pgo_last_size": -1,
         "pgo_stable_count": 0,
         "selected_session": KNOWN_SESSIONS[0]["name"],
+        "action_in_progress": False,
+        "last_sub": "start",
+        "last_step": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -632,6 +652,7 @@ def render_sidebar():
         st.sidebar.divider()
         if st.sidebar.button(t("abort_mapping"), type="primary", key="sidebar_abort"):
             screen_stop_all()
+            get_monitor_manager().reset()
             add_message(t("abort_done"))
             st.session_state.current_step = 0
             st.session_state.current_sub = "start"
@@ -754,6 +775,7 @@ def render_messages():
 
 def render_step0():
     st.header(t("s0_header"))
+    get_monitor_manager().reset()
 
     setup_path = ALGOR_WS_ROOT / "install" / "setup.bash"
     ws_info = f"Workspace: `{ALGOR_WS_ROOT}`\nROS_DISTRO: `{ROS2_ENV.get('ROS_DISTRO', 'N/A')}`"
@@ -763,7 +785,8 @@ def render_step0():
 
     st.markdown(t("s0_desc"))
 
-    if st.button(t("start_workflow"), type="primary", key="btn_step0_start"):
+    if st.button(t("start_workflow"), type="primary", key="btn_step0_start", disabled=st.session_state.action_in_progress):
+        st.session_state.action_in_progress = True
         st.session_state.current_step = 1
         st.session_state.current_sub = "start_livox"
         st.session_state.step_messages = []
@@ -777,7 +800,8 @@ def render_step1():
     # Start Livox
     if sub == "start_livox":
         st.markdown(t("s1_start_livox_desc"))
-        if st.button(t("s1_start_livox"), type="primary", key="btn_s1_livox"):
+        if st.button(t("s1_start_livox"), type="primary", key="btn_s1_livox", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             add_message("Starting Livox lidar...")
             screen_launch("livox", LIVOX_LAUNCH_CMD)
             st.session_state.current_sub = "wait_livox"
@@ -813,7 +837,8 @@ def render_step1():
     # Start nav_bridge
     if sub == "start_nav":
         st.markdown(t("s1_start_nav_desc"))
-        if st.button(t("s1_start_nav"), type="primary", key="btn_s1_nav"):
+        if st.button(t("s1_start_nav"), type="primary", key="btn_s1_nav", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             add_message("Starting nav_bridge for IMU...")
             screen_launch("nav_bridge", NAV_BRIDGE_LAUNCH_CMD)
             st.session_state.current_sub = "wait_nav"
@@ -849,7 +874,8 @@ def render_step1():
     # Release control
     if sub == "release_control":
         st.markdown(t("s1_release_desc"))
-        if st.button(t("s1_release"), type="primary", key="btn_s1_release"):
+        if st.button(t("s1_release"), type="primary", key="btn_s1_release", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             add_message("Calling /nav_bridge_node/release_control...")
             output = run_ros2_cmd(
                 "ros2 service call /nav_bridge_node/release_control std_srvs/srv/Trigger"
@@ -875,7 +901,8 @@ def render_step2():
     # Stand up
     if sub == "stand_up":
         st.markdown(t("s2_stand_desc"))
-        if st.button(t("s2_stand_btn"), type="primary", key="btn_s2_stand"):
+        if st.button(t("s2_stand_btn"), type="primary", key="btn_s2_stand", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             add_message("Robot is standing")
             st.session_state.current_sub = "start_slam"
             st.rerun()
@@ -883,7 +910,8 @@ def render_step2():
     # Start SLAM
     if sub == "start_slam":
         st.markdown(t("s2_start_slam_desc"))
-        if st.button(t("s2_start_slam"), type="primary", key="btn_s2_slam"):
+        if st.button(t("s2_start_slam"), type="primary", key="btn_s2_slam", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             add_message("Starting SLAM with PGO + Rviz...")
             screen_launch("slam", SLAM_PGO_LAUNCH_CMD)
             st.session_state.current_sub = "wait_slam"
@@ -920,7 +948,8 @@ def render_step2():
         st.markdown(
             f"**Start recording** `{LIVOX_TOPIC}` and `{IMU_TOPIC}` to bag `{bag_name}`."
         )
-        if st.button(t("s2_start_rec"), type="primary", key="btn_s2_bag"):
+        if st.button(t("s2_start_rec"), type="primary", key="btn_s2_bag", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             BAGS_DIR.mkdir(parents=True, exist_ok=True)
             add_message(f"Recording bag '{bag_name}' in ~/bags ...")
             cmd = f"ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
@@ -941,7 +970,8 @@ def render_step2():
 
         st.markdown(t("s2_navigate_desc"))
 
-        if st.button(t("s2_mapping_done"), type="primary", key="btn_s2_done"):
+        if st.button(t("s2_mapping_done"), type="primary", key="btn_s2_done", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             add_message("Mapping complete - stopping bag recording...")
             screen_stop("bag_rec")
             add_message("Bag recording stopped")
@@ -1006,7 +1036,8 @@ def render_step2():
             st.markdown(
                 f"**PGO output is ready.** Click to copy to `prior/{map_name}/`."
             )
-            if st.button(f"Copy to prior/{map_name}/", type="primary", key="btn_s2_copy"):
+            if st.button(f"Copy to prior/{map_name}/", type="primary", key="btn_s2_copy", disabled=st.session_state.action_in_progress):
+                st.session_state.action_in_progress = True
                 msgs = copy_pgo_to_prior(map_name)
                 for m in msgs:
                     add_message(m)
@@ -1040,7 +1071,8 @@ def render_step3():
         st.markdown("**Stop live sensor nodes and start relocalization** with the prior map.")
         relocal_cmd = RELOCAL_LAUNCH_CMD.format(prior=map_name)
         st.code(relocal_cmd)
-        if st.button("Start Relocalization", type="primary", key="btn_s3_relocal"):
+        if st.button("Start Relocalization", type="primary", key="btn_s3_relocal", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             if _session_alive("livox"):
                 screen_stop("livox")
                 add_message("Stopped livox")
@@ -1079,7 +1111,8 @@ def render_step3():
     # Start grid mapper
     if sub == "start_grid":
         st.markdown("**Start the grid mapper + Rviz.**")
-        if st.button("Start Grid Mapper", type="primary", key="btn_s3_grid"):
+        if st.button("Start Grid Mapper", type="primary", key="btn_s3_grid", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             add_message("Starting global grid mapper + Rviz...")
             screen_launch("gridmapper", GRIDMAPPER_LAUNCH_CMD)
             st.session_state.current_sub = "wait_rviz"
@@ -1089,7 +1122,8 @@ def render_step3():
         alive = _session_alive("gridmapper")
         st.markdown(f"**Grid Mapper:** {'running' if alive else 'stopped'}")
         st.markdown("**Wait for Rviz to load**, then click below.")
-        if st.button("Rviz Ready", type="primary", key="btn_s3_rviz"):
+        if st.button("Rviz Ready", type="primary", key="btn_s3_rviz", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             st.session_state.current_sub = "start_playback"
             st.rerun()
 
@@ -1103,7 +1137,8 @@ def render_step3():
         if bag_dir:
             st.markdown(f"**Play the recorded bag** with `--clock`.")
             st.code(f"ros2 bag play {bag_dir} --clock")
-            if st.button("Start Playback", type="primary", key="btn_s3_play"):
+            if st.button("Start Playback", type="primary", key="btn_s3_play", disabled=st.session_state.action_in_progress):
+                st.session_state.action_in_progress = True
                 add_message(f"Playing bag '{bag_dir}' with --clock...")
                 cmd = f"ros2 bag play {bag_dir} --clock"
                 screen_launch("bag_play", cmd)
@@ -1138,7 +1173,8 @@ def render_step3():
             "**Check the grid map in Rviz.** "
             "When satisfied, click below to stop all nodes."
         )
-        if st.button("Stop All Nodes", type="primary", key="btn_s3_stop"):
+        if st.button("Stop All Nodes", type="primary", key="btn_s3_stop", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             st.session_state.current_sub = "stop_nodes"
             st.rerun()
 
@@ -1211,14 +1247,16 @@ def render_step3():
                 st.markdown(f"MISSING - `{f.name}`")
         if map_png.exists():
             st.image(str(map_png), caption="map.png (generated)", width="stretch")
-            if st.button("Proceed to Rename", type="primary", key="btn_s3_rename_go"):
+            if st.button("Proceed to Rename", type="primary", key="btn_s3_rename_go", disabled=st.session_state.action_in_progress):
+                st.session_state.action_in_progress = True
                 st.session_state.current_sub = "rename"
                 st.rerun()
 
     # Rename
     if sub == "rename":
         st.markdown(f"**Rename** `map.*` -> `{map_name}.*` and update yaml.")
-        if st.button(f"Rename to '{map_name}'", type="primary", key="btn_s3_rename"):
+        if st.button(f"Rename to '{map_name}'", type="primary", key="btn_s3_rename", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             msgs = rename_grid_map("map", map_name)
             for m in msgs:
                 add_message(m)
@@ -1234,14 +1272,16 @@ def render_step3():
         )
         if renamed_png.exists():
             st.image(str(renamed_png), caption=f"{map_name}.png", width="stretch")
-        if st.button("Map Looks Good", type="primary", key="btn_s3_review"):
+        if st.button("Map Looks Good", type="primary", key="btn_s3_review", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             st.session_state.current_sub = "copy_maps"
             st.rerun()
 
     # Copy to maps
     if sub == "copy_maps":
         st.markdown(f"**Copy** map files to `{MAPS_DIR}/` for navigation.")
-        if st.button(f"Copy to {MAPS_DIR.name}/", type="primary", key="btn_s3_copy"):
+        if st.button(f"Copy to {MAPS_DIR.name}/", type="primary", key="btn_s3_copy", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             msgs = copy_grid_map(map_name)
             for m in msgs:
                 add_message(m)
@@ -1257,7 +1297,8 @@ def render_step3():
         )
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Rebuild Now", type="primary", key="btn_s3_rebuild"):
+            if st.button("Rebuild Now", type="primary", key="btn_s3_rebuild", disabled=st.session_state.action_in_progress):
+                st.session_state.action_in_progress = True
                 add_message("Running colcon build...")
                 cmd = f"{build_cmd} 2>&1"
                 screen_launch("build", cmd, cwd=str(ALGOR_WS_ROOT))
@@ -1296,7 +1337,8 @@ def render_step4():
         if running:
             names = ", ".join(n for n, _ in running)
             st.markdown(f"**Remaining running sessions:** {names}")
-            if st.button("Stop All Remaining Sessions", type="primary", key="btn_s4_stop"):
+            if st.button("Stop All Remaining Sessions", type="primary", key="btn_s4_stop", disabled=st.session_state.action_in_progress):
+                st.session_state.action_in_progress = True
                 for n, _ in running:
                     screen_stop(n)
                     add_message(f"Stopped {n}")
@@ -1310,8 +1352,10 @@ def render_step4():
     if sub == "done":
         st.markdown(t("s4_all_done"))
 
-        if st.button(t("s4_reset"), type="primary", key="btn_s4_reset"):
+        if st.button(t("s4_reset"), type="primary", key="btn_s4_reset", disabled=st.session_state.action_in_progress):
+            st.session_state.action_in_progress = True
             screen_stop_all()
+            get_monitor_manager().reset()
             if LOGS_DIR.exists():
                 shutil.rmtree(LOGS_DIR, ignore_errors=True)
                 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1334,6 +1378,15 @@ def render_step4():
 
 
 def main():
+    # Track sub-step changes to clear click lock
+    if "last_sub" not in st.session_state or st.session_state.last_sub != st.session_state.current_sub:
+        st.session_state.last_sub = st.session_state.current_sub
+        st.session_state.action_in_progress = False
+
+    if "last_step" not in st.session_state or st.session_state.last_step != st.session_state.current_step:
+        st.session_state.last_step = st.session_state.current_step
+        st.session_state.action_in_progress = False
+
     st.title(t("page_title"))
     render_sidebar()
 
@@ -1362,6 +1415,7 @@ def main():
                     for name in known_live:
                         _force_kill(name)
                     clean_orphans()
+                    get_monitor_manager().reset()
                     st.session_state.refresh_dismissed = True
                     st.rerun()
             with c2:
