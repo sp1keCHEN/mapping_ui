@@ -47,9 +47,9 @@ LOGS_DIR = ALGOR_WS_ROOT / "mapping_logs"
 # ROS2 launch commands
 LIVOX_LAUNCH_CMD = "ros2 launch livox_ros_driver2 msg_multi_MID360_launch.py"
 NAV_BRIDGE_LAUNCH_CMD = "ros2 launch nav_bridge nav_bridge.launch.py"
-SLAM_PGO_LAUNCH_CMD = "ros2 launch faster_lio slam.launch.py pgo:=true rviz:=true"
+SLAM_PGO_LAUNCH_CMD = "ros2 launch faster_lio slam.launch.py pgo:=true rviz:=false"
 RELOCAL_LAUNCH_CMD = "ros2 launch faster_lio slam.launch.py relocal:=true prior_dir:={prior}"
-GRIDMAPPER_LAUNCH_CMD = "ros2 launch gridmapper global.launch.py rviz:=true"
+GRIDMAPPER_LAUNCH_CMD = "ros2 launch gridmapper global.launch.py rviz:=false"
 
 LIVOX_TOPIC = "/livox/lidar"
 IMU_TOPIC = "/imu/data"
@@ -283,16 +283,30 @@ def _strip_ansi(text: str) -> str:
 
 def screen_read_log(name: str, max_lines: int = 100) -> str:
     info = _get_session(name)
-    if not info:
+    if not info or not info.get("log_file"):
         return "(session not registered)"
-    try:
-        result = subprocess.run(
-            f"tail -n {max_lines} {info['log_file']}",
-            shell=True, capture_output=True, text=True, timeout=3,
-        )
-        return _strip_ansi(result.stdout) or "(empty)"
-    except FileNotFoundError:
+    log_path = Path(info["log_file"])
+    if not log_path.exists():
         return "(log file not found)"
+    try:
+        # Fast native Python tail implementation using binary seek (0% CPU, 0 subprocesses)
+        block_size = 65536
+        with open(log_path, "rb") as f:
+            try:
+                f.seek(0, 2)
+                file_size = f.tell()
+                if file_size > block_size:
+                    f.seek(-block_size, 2)
+                else:
+                    f.seek(0)
+                data = f.read()
+            except OSError:
+                f.seek(0)
+                data = f.read()
+        text = data.decode("utf-8", errors="ignore")
+        lines = text.splitlines()
+        tail_lines = lines[-max_lines:]
+        return _strip_ansi("\n".join(tail_lines)) or "(empty)"
     except Exception as e:
         return f"(error: {e})"
 
@@ -355,47 +369,69 @@ def check_node_exists(node_name: str) -> bool:
 
 import threading
 
-_TOPIC_RATES = {
-    "/livox/lidar": 0.0,
-    "/imu/data": 0.0
-}
-_MONITOR_THREAD = None
-_MONITOR_STOP = False
+@st.cache_resource
+def get_monitor_manager():
+    class MonitorManager:
+        def __init__(self):
+            self.rates = {
+                "/livox/lidar": 0.0,
+                "/imu/data": 0.0
+            }
+            self.last_request = {}
+            self.stop_event = threading.Event()
+            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.thread.start()
 
-def _topic_monitor_loop():
-    global _MONITOR_STOP
-    while not _MONITOR_STOP:
-        for topic in list(_TOPIC_RATES.keys()):
-            if _MONITOR_STOP:
-                break
-            # Generous 3s timeout for background discovery + calculation
-            output = run_ros2_cmd(
-                f"ros2 topic hz {topic} --window 3",
-                timeout=3,
-            )
-            rate = 0.0
-            if output:
-                for line in output.splitlines():
-                    if "average rate:" in line:
-                        try:
-                            rate = float(line.split("average rate:")[1].strip().split()[0])
-                            break
-                        except (ValueError, IndexError):
-                            pass
-            _TOPIC_RATES[topic] = rate
-        time.sleep(0.5)
+        def _loop(self):
+            while not self.stop_event.is_set():
+                active_topics = []
+                now = time.monotonic()
+                for topic in list(self.rates.keys()):
+                    # Only monitor if this topic was queried in the last 6 seconds
+                    if now - self.last_request.get(topic, 0.0) < 6.0:
+                        active_topics.append(topic)
 
-def start_topic_monitor():
-    global _MONITOR_THREAD, _MONITOR_STOP
-    if _MONITOR_THREAD is None or not _MONITOR_THREAD.is_alive():
-        _MONITOR_STOP = False
-        _MONITOR_THREAD = threading.Thread(target=_topic_monitor_loop, daemon=True)
-        _MONITOR_THREAD.start()
+                if not active_topics:
+                    time.sleep(1.0)
+                    continue
+
+                for topic in active_topics:
+                    if self.stop_event.is_set():
+                        break
+
+                    # 1. Low-overhead pre-check: if no active publishers, rate is 0.0 instantly
+                    if check_topic_publishers(topic) <= 0:
+                        self.rates[topic] = 0.0
+                        continue
+
+                    # 2. Only run heavier ros2 topic hz when publisher exists
+                    output = run_ros2_cmd(
+                        f"ros2 topic hz {topic} --window 2",
+                        timeout=2,
+                    )
+                    rate = 0.0
+                    if output:
+                        for line in output.splitlines():
+                            if "average rate:" in line:
+                                try:
+                                    rate = float(line.split("average rate:")[1].strip().split()[0])
+                                    break
+                                except (ValueError, IndexError):
+                                    pass
+                    self.rates[topic] = rate
+                time.sleep(1.0)
+
+        def get_hz(self, topic):
+            self.last_request[topic] = time.monotonic()
+            return self.rates.get(topic, 0.0)
+
+    return MonitorManager()
+
 
 def get_topic_hz(topic: str, timeout: int = 1) -> float:
-    """Read topic rate from the background topic monitor (completely non-blocking)."""
-    start_topic_monitor()
-    return _TOPIC_RATES.get(topic, 0.0)
+    """Read topic rate from the resource-cached background monitor (completely non-blocking)."""
+    manager = get_monitor_manager()
+    return manager.get_hz(topic)
 
 
 # ---------------------------------------------------------------------------
@@ -616,14 +652,12 @@ def _list_screen_sessions() -> list[str]:
             "screen -ls", shell=True, capture_output=True, text=True, timeout=5,
         )
         names: list[str] = []
+        # Robust regex matching for "  PID.name  (Detached)" independent of tab or space format
+        pattern = re.compile(r"^\s*(\d+)\.([^\s]+)")
         for line in result.stdout.splitlines():
-            line = line.strip()
-            # Lines look like: "12345.slam	(05/29/26 17:00:00)	(Detached)"
-            if "." in line and ("Detached" in line or "Attached" in line):
-                # Extract the name after the PID dot
-                part = line.split("\t")[0]   # "12345.slam"
-                name = part.split(".", 1)[1] if "." in part else part
-                names.append(name)
+            m = pattern.match(line.strip())
+            if m:
+                names.append(m.group(2))
         return names
     except Exception:
         return []
@@ -768,7 +802,7 @@ def render_step1():
             add_message(f"WARN: No data on {LIVOX_TOPIC} after 20s")
             st.rerun()
         else:
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
 
     # Livox status after launch
     if sub in ("start_nav", "wait_nav", "release_control"):
@@ -804,7 +838,7 @@ def render_step1():
             add_message(f"WARN: No data on {IMU_TOPIC} after 20s")
             st.rerun()
         else:
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
 
     # nav_bridge status
     if sub == "release_control":
@@ -872,7 +906,7 @@ def render_step2():
             add_message("WARN: laser_mapping not detected after 30s")
             st.rerun()
         else:
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
 
     # SLAM status
     if sub in ("start_bag", "navigate"):
@@ -954,7 +988,7 @@ def render_step2():
                 st.rerun()
 
             st.caption(f"Size stability: {st.session_state.pgo_stable_count} / 3")
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
         elif elapsed >= 120:
             if pcd_exists and kf_exists:
                 add_message("WARN: PGO output found but size still changing")
@@ -1035,7 +1069,7 @@ def render_step3():
             add_message("WARN: laser_mapping not detected after 30s")
             st.rerun()
         else:
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
 
     # Relocal status
     if sub in ("start_grid", "wait_rviz", "start_playback", "wait_playback"):
@@ -1092,7 +1126,7 @@ def render_step3():
             if st.button("Skip Playback Wait", key="btn_s3_skip_play"):
                 st.session_state.current_sub = "observe"
                 st.rerun()
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
         else:
             add_message("Bag playback finished")
             st.session_state.current_sub = "observe"
@@ -1162,7 +1196,7 @@ def render_step3():
             st.session_state.current_sub = "check_output"
             st.rerun()
         else:
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
 
     # Check output
     if sub == "check_output":
@@ -1243,7 +1277,7 @@ def render_step3():
             st.markdown("**Build in progress...**")
             log_tail = screen_read_log("build", max_lines=20)
             st.code(log_tail, language="text")
-            pass  # fragment auto-reruns every 3s
+            pass  # fragment auto-reruns every 1s
         else:
             add_message("Build complete")
             st.session_state.current_step = 4
