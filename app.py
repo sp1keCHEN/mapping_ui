@@ -334,10 +334,14 @@ _init_sessions()
 def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
     import signal
     try:
+        # Force PYTHONUNBUFFERED=1 to ensure that Python-based ROS2 CLI tools
+        # flush stdout immediately when redirected to a pipe.
+        env = ROS2_ENV.copy()
+        env["PYTHONUNBUFFERED"] = "1"
         # start_new_session=True creates a new process group.
         # When timing out, we SIGKILL the entire group to guarantee that no orphaned ROS2 child nodes leak.
         proc = subprocess.Popen(
-            cmd, shell=True, env=ROS2_ENV,
+            cmd, shell=True, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True
         )
@@ -417,10 +421,12 @@ def get_monitor_manager():
                         self.rates[topic] = 0.0
                         continue
 
-                    # 3. Only run heavier ros2 topic hz when publisher exists
+                    # 3. Only run heavier ros2 topic hz when publisher exists.
+                    # We wrap with timeout --signal=INT 2 so that it exits gracefully via Ctrl+C (SIGINT)
+                    # after 2 seconds, which flushes its stdout buffer naturally.
                     output = run_ros2_cmd(
-                        f"ros2 topic hz {topic} --window 2",
-                        timeout=2,
+                        f"timeout --signal=INT 2 ros2 topic hz {topic} --window 2",
+                        timeout=3,
                     )
                     rate = 0.0
                     if output:
