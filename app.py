@@ -213,7 +213,7 @@ def screen_launch(name: str, cmd: str, cwd: str | None = None) -> str:
     else:
         full_cmd = stdbuf_cmd
     subprocess.run(
-        f"screen -dmS {name} bash -c '{full_cmd}'",
+        f'screen -dmS {name} bash -c "{full_cmd}"',
         shell=True, env=ROS2_ENV,
     )
     time.sleep(0.5)
@@ -250,9 +250,24 @@ def screen_restart(name: str) -> str | None:
     return screen_launch(name, info["cmd"])
 
 
+def clean_orphans() -> None:
+    """Force kill all orphaned ROS2, RViz, Livox, and bag processes to free DDS domains."""
+    patterns = [
+        "faster_lio", "faster_pgo", "rviz2", "nav_bridge",
+        "livox_ros_driver2", "gridmapper",
+        "run_mapping_online_ros2"
+    ]
+    for p in patterns:
+        try:
+            subprocess.run(f"pkill -f -9 '{p}'", shell=True, timeout=2)
+        except Exception:
+            pass
+
+
 def screen_stop_all() -> None:
     for name in list(st.session_state.sessions.keys()):
         _force_kill(name)
+    clean_orphans()
 
 
 # ANSI escape sequence removal
@@ -334,26 +349,53 @@ def check_topic_publishers(topic: str) -> int:
 
 
 def check_node_exists(node_name: str) -> bool:
-    output = run_ros2_cmd("ros2 node list")
+    output = run_ros2_cmd("ros2 node list", timeout=2)
     return output is not None and node_name in output
 
 
-def get_topic_hz(topic: str, timeout: int = 3) -> float:
-    """Get topic publish rate. Jazzy has no --timeout flag, so we rely
-    on subprocess timeout to kill the process after *timeout* seconds."""
-    output = run_ros2_cmd(
-        f"ros2 topic hz {topic} --window 3",
-        timeout=timeout,
-    )
-    if not output:
-        return 0.0
-    for line in output.splitlines():
-        if "average rate:" in line:
-            try:
-                return float(line.split("average rate:")[1].strip().split()[0])
-            except (ValueError, IndexError):
-                pass
-    return 0.0
+import threading
+
+_TOPIC_RATES = {
+    "/livox/lidar": 0.0,
+    "/imu/data": 0.0
+}
+_MONITOR_THREAD = None
+_MONITOR_STOP = False
+
+def _topic_monitor_loop():
+    global _MONITOR_STOP
+    while not _MONITOR_STOP:
+        for topic in list(_TOPIC_RATES.keys()):
+            if _MONITOR_STOP:
+                break
+            # Generous 3s timeout for background discovery + calculation
+            output = run_ros2_cmd(
+                f"ros2 topic hz {topic} --window 3",
+                timeout=3,
+            )
+            rate = 0.0
+            if output:
+                for line in output.splitlines():
+                    if "average rate:" in line:
+                        try:
+                            rate = float(line.split("average rate:")[1].strip().split()[0])
+                            break
+                        except (ValueError, IndexError):
+                            pass
+            _TOPIC_RATES[topic] = rate
+        time.sleep(0.5)
+
+def start_topic_monitor():
+    global _MONITOR_THREAD, _MONITOR_STOP
+    if _MONITOR_THREAD is None or not _MONITOR_THREAD.is_alive():
+        _MONITOR_STOP = False
+        _MONITOR_THREAD = threading.Thread(target=_topic_monitor_loop, daemon=True)
+        _MONITOR_THREAD.start()
+
+def get_topic_hz(topic: str, timeout: int = 1) -> float:
+    """Read topic rate from the background topic monitor (completely non-blocking)."""
+    start_topic_monitor()
+    return _TOPIC_RATES.get(topic, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -587,91 +629,70 @@ def _list_screen_sessions() -> list[str]:
         return []
 
 
-@st.fragment(run_every=2)
-def _render_log_viewer(session_name: str):
-    """Log viewer as a Streamlit fragment — only this section re-renders."""
-    st.subheader(t("log"))
-    log_text = screen_read_log(session_name, max_lines=200)
-    st.code(log_text, language="text", height=500)
-
-
-def render_left_panel():
-    st.header(t("sessions"))
-
-    # Build session list: known sessions + any live ones not in the known list
+def render_session_bar():
+    """Horizontal session management bar."""
     live_sessions = _list_screen_sessions()
-    all_names = list(SESSION_NAMES)  # start with known
-    for name in live_sessions:
-        if name not in all_names:
-            all_names.append(name)
 
-    # Session selector
-    default_idx = 0
-    if st.session_state.selected_session in all_names:
-        default_idx = all_names.index(st.session_state.selected_session)
-    selected = st.selectbox(
-        t("select_session"),
-        options=all_names,
-        index=default_idx,
-        format_func=lambda n: SESSION_LABEL.get(n, n),
-    )
-    st.session_state.selected_session = selected
+    if not live_sessions:
+        st.caption(t("no_active"))
+        return None
 
-    # Live status
-    alive = _session_alive(selected)
+    cols = st.columns([3, 1, 1, 1, 1])
+
+    with cols[0]:
+        default_idx = 0
+        if st.session_state.selected_session in live_sessions:
+            default_idx = live_sessions.index(st.session_state.selected_session)
+        selected = st.selectbox(
+            t("select_session"),
+            options=live_sessions,
+            index=default_idx,
+            format_func=lambda n: SESSION_LABEL.get(n, n),
+            label_visibility="collapsed",
+        )
+        st.session_state.selected_session = selected
+
     info = _get_session(selected)
 
-    status_icon = "&#9989;" if alive else "&#9760;"
-    st.markdown(f"**{t('status')}:** {status_icon} {t('running') if alive else t('stopped')}")
-
-    if info:
-        st.caption(f"Command: `{info['cmd']}`")
-        st.caption(f"Log: `{info['log_file']}`")
-    else:
-        st.caption(t("not_launched"))
-
-    # Controls
-    ctrl_cols = st.columns(3)
-    with ctrl_cols[0]:
-        if st.button(t("refresh"), key=f"left_refresh_{selected}", use_container_width=True):
+    with cols[1]:
+        if st.button(t("stop"), key=f"bar_stop_{selected}", type="primary", width="stretch"):
+            screen_stop(selected)
+            add_message(f"Stopped {selected}")
             st.rerun()
-    with ctrl_cols[1]:
-        if alive:
-            if st.button(t("stop"), key=f"left_stop_{selected}", type="primary", use_container_width=True):
-                screen_stop(selected)
-                add_message(f"Stopped {selected}")
-                st.rerun()
-        else:
-            if st.button(t("restart"), key=f"left_restart_{selected}", use_container_width=True):
-                result = screen_restart(selected)
-                if result:
-                    add_message(f"Restarted {selected}")
-                else:
-                    add_message(f"Unknown session: {selected}")
-                st.rerun()
-    with ctrl_cols[2]:
+    with cols[2]:
+        if st.button(t("restart"), key=f"bar_restart_{selected}", width="stretch"):
+            result = screen_restart(selected)
+            if result:
+                add_message(f"Restarted {selected}")
+            else:
+                add_message(f"Cannot restart: {selected}")
+            st.rerun()
+    with cols[3]:
+        if st.button(t("refresh"), key=f"bar_refresh_{selected}", width="stretch"):
+            st.rerun()
+    with cols[4]:
         if info and info["log_file"] and Path(info["log_file"]).exists():
             st.download_button(
                 "DL Log",
                 data=screen_read_log_full(selected),
                 file_name=f"{selected}.log",
                 mime="text/plain",
-                key=f"left_dl_{selected}",
-                use_container_width=True,
+                key=f"bar_dl_{selected}",
+                width="stretch",
             )
 
-    st.divider()
-    _render_log_viewer(selected)
+    # Show the command this session is running
+    if info:
+        st.caption(f"Command: `{info['cmd']}`")
 
-    # All sessions overview — live from screen -ls
-    st.divider()
-    st.subheader(t("all_sessions"))
-    if live_sessions:
-        for name in live_sessions:
-            label = SESSION_LABEL.get(name, name)
-            st.markdown(f"🟢 **{label}** (running)")
-    else:
-        st.caption(t("no_active"))
+    return selected
+
+
+@st.fragment(run_every=1)
+def _render_log_viewer(session_name: str):
+    """Log viewer as a Streamlit fragment — only this section re-renders."""
+    log_text = screen_read_log(session_name, max_lines=200)
+    st.code(log_text, language="text", height=400)
 
 # ---------------------------------------------------------------------------
 # RIGHT PANEL - Mapping workflow
@@ -679,44 +700,22 @@ def render_left_panel():
 
 
 def render_messages():
+    """Fixed-height message panel with auto-scroll to latest."""
     messages = st.session_state.step_messages
-    if not messages:
-        return
-
     st.markdown(f"**{t('messages')}**")
-
-    # Build message HTML
-    lines: list[str] = []
-    for msg in messages:
-        if "ERROR" in msg:
-            color = "#ff4b4b"
-        elif "WARN" in msg:
-            color = "#ffa726"
-        elif any(kw in msg for kw in ("OK", "Copied", "Renamed", "ready")):
-            color = "#66bb6a"
+    with st.container(height=350):
+        if not messages:
+            st.caption("—")
         else:
-            color = "#ccc"
-        escaped = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        lines.append(f'<div style="color:{color};padding:2px 0;font-size:13px;font-family:monospace">{escaped}</div>')
-
-    html_content = "\n".join(lines)
-    # Fixed-height scrollable container that auto-scrolls to bottom
-    st.components.v1.html(f"""
-    <div id="msg-box" style="
-        height: 200px;
-        overflow-y: auto;
-        background: #1a1a2e;
-        border-radius: 6px;
-        padding: 8px 12px;
-        border: 1px solid #333;
-    ">
-        {html_content}
-    </div>
-    <script>
-        var box = document.getElementById('msg-box');
-        box.scrollTop = box.scrollHeight;
-    </script>
-    """, height=230)
+            for msg in messages:
+                if "ERROR" in msg:
+                    st.error(msg)
+                elif "WARN" in msg:
+                    st.warning(msg)
+                elif any(kw in msg for kw in ("OK", "Copied", "Renamed", "ready")):
+                    st.success(msg)
+                else:
+                    st.text(msg)
 
 
 def render_step0():
@@ -769,8 +768,7 @@ def render_step1():
             add_message(f"WARN: No data on {LIVOX_TOPIC} after 20s")
             st.rerun()
         else:
-            time.sleep(2)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
 
     # Livox status after launch
     if sub in ("start_nav", "wait_nav", "release_control"):
@@ -806,8 +804,7 @@ def render_step1():
             add_message(f"WARN: No data on {IMU_TOPIC} after 20s")
             st.rerun()
         else:
-            time.sleep(2)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
 
     # nav_bridge status
     if sub == "release_control":
@@ -828,7 +825,6 @@ def render_step1():
             st.session_state.current_sub = "stand_up"
             if not st.session_state.map_name:
                 st.session_state.map_name = datetime.now().strftime("sensor_%y%m%d_%H%M")
-            st.session_state.step_messages = []
             st.rerun()
 
 
@@ -876,8 +872,7 @@ def render_step2():
             add_message("WARN: laser_mapping not detected after 30s")
             st.rerun()
         else:
-            time.sleep(2)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
 
     # SLAM status
     if sub in ("start_bag", "navigate"):
@@ -959,8 +954,7 @@ def render_step2():
                 st.rerun()
 
             st.caption(f"Size stability: {st.session_state.pgo_stable_count} / 3")
-            time.sleep(3)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
         elif elapsed >= 120:
             if pcd_exists and kf_exists:
                 add_message("WARN: PGO output found but size still changing")
@@ -990,14 +984,12 @@ def render_step2():
                     add_message(f"WARN: Bag for '{st.session_state.bag_name}' not found")
                 st.session_state.current_step = 3
                 st.session_state.current_sub = "start_relocal"
-                st.session_state.step_messages = []
                 st.rerun()
         else:
             st.warning("PGO output not found. Check logs on the left.")
             if st.button("Continue to Step 3 (may fail)", key="btn_s2_no_pgo"):
                 st.session_state.current_step = 3
                 st.session_state.current_sub = "start_relocal"
-                st.session_state.step_messages = []
                 st.rerun()
 
 
@@ -1043,8 +1035,7 @@ def render_step3():
             add_message("WARN: laser_mapping not detected after 30s")
             st.rerun()
         else:
-            time.sleep(2)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
 
     # Relocal status
     if sub in ("start_grid", "wait_rviz", "start_playback", "wait_playback"):
@@ -1101,8 +1092,7 @@ def render_step3():
             if st.button("Skip Playback Wait", key="btn_s3_skip_play"):
                 st.session_state.current_sub = "observe"
                 st.rerun()
-            time.sleep(3)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
         else:
             add_message("Bag playback finished")
             st.session_state.current_sub = "observe"
@@ -1172,8 +1162,7 @@ def render_step3():
             st.session_state.current_sub = "check_output"
             st.rerun()
         else:
-            time.sleep(2)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
 
     # Check output
     if sub == "check_output":
@@ -1187,7 +1176,7 @@ def render_step3():
             else:
                 st.markdown(f"MISSING - `{f.name}`")
         if map_png.exists():
-            st.image(str(map_png), caption="map.png (generated)", use_container_width=True)
+            st.image(str(map_png), caption="map.png (generated)", width="stretch")
             if st.button("Proceed to Rename", type="primary", key="btn_s3_rename_go"):
                 st.session_state.current_sub = "rename"
                 st.rerun()
@@ -1210,7 +1199,7 @@ def render_step3():
             "**Do NOT change the resolution.**"
         )
         if renamed_png.exists():
-            st.image(str(renamed_png), caption=f"{map_name}.png", use_container_width=True)
+            st.image(str(renamed_png), caption=f"{map_name}.png", width="stretch")
         if st.button("Map Looks Good", type="primary", key="btn_s3_review"):
             st.session_state.current_sub = "copy_maps"
             st.rerun()
@@ -1245,7 +1234,6 @@ def render_step3():
                 add_message("Skipped rebuild")
                 st.session_state.current_step = 4
                 st.session_state.current_sub = "cleanup"
-                st.session_state.step_messages = []
                 st.rerun()
 
     # Wait build
@@ -1255,13 +1243,11 @@ def render_step3():
             st.markdown("**Build in progress...**")
             log_tail = screen_read_log("build", max_lines=20)
             st.code(log_tail, language="text")
-            time.sleep(3)
-            st.rerun()
+            pass  # fragment auto-reruns every 3s
         else:
             add_message("Build complete")
             st.session_state.current_step = 4
             st.session_state.current_sub = "cleanup"
-            st.session_state.step_messages = []
             st.rerun()
 
 
@@ -1280,6 +1266,7 @@ def render_step4():
                 for n, _ in running:
                     screen_stop(n)
                     add_message(f"Stopped {n}")
+                clean_orphans()
                 st.session_state.current_sub = "done"
                 st.rerun()
         else:
@@ -1318,14 +1305,14 @@ def main():
 
     # --- Browser-level refresh guard while workflow is active ---
     if 0 < st.session_state.current_step < 4:
-        st.components.v1.html("""
+        st.html("""
         <script>
         window.addEventListener('beforeunload', function(e) {
             e.preventDefault();
             e.returnValue = '';
         });
         </script>
-        """, height=0)
+        """)
 
     # --- In-page warning: detect stale sessions on fresh page load ---
     if st.session_state.current_step == 0:
@@ -1340,6 +1327,7 @@ def main():
                 if st.button(t("stop_all_restart"), type="primary", key="btn_refresh_stop"):
                     for name in known_live:
                         _force_kill(name)
+                    clean_orphans()
                     st.session_state.refresh_dismissed = True
                     st.rerun()
             with c2:
@@ -1348,14 +1336,12 @@ def main():
                     st.rerun()
             return  # Don't render the workflow until user decides
 
-    left_col, right_col = st.columns([1, 2])
+    # ── Row 1: Step (left) + Messages (right) ──
+    step_col, msg_col = st.columns([3, 2])
 
-    with left_col:
-        render_left_panel()
-
-    with right_col:
-        step_placeholder = st.empty()
-        with step_placeholder.container():
+    with step_col:
+        @st.fragment(run_every=1)
+        def _step_fragment():
             step_renderers = {
                 0: render_step0,
                 1: render_step1,
@@ -1366,9 +1352,23 @@ def main():
             renderer = step_renderers.get(st.session_state.current_step)
             if renderer:
                 renderer()
+        _step_fragment()
 
-        st.divider()
-        render_messages()
+    with msg_col:
+        @st.fragment(run_every=1)
+        def _msg_fragment():
+            render_messages()
+        _msg_fragment()
+
+    # ── Row 2: Session management ──
+    st.divider()
+    st.markdown(f"**{t('sessions')}**")
+    selected = render_session_bar()
+
+    # ── Row 3: Log viewer ──
+    if selected:
+        st.markdown(f"**{t('log')}**")
+        _render_log_viewer(selected)
 
 
 if __name__ == "__main__":

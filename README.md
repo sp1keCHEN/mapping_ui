@@ -1,148 +1,103 @@
-# Mapping Scripts
+# ROS2 自动化建图工具用户手册 (Mapping Scripts)
 
-交互式 ROS2 建图 Web 工具，引导完成从传感器启动到栅格地图部署的全流程。
+这是一个交互式的 ROS2 建图辅助 Web 工具，旨在引导操作人员完成从雷达/IMU启动、三维点云建图（faster-lio PGO）、数据包录制，到离线栅格地图生成（gridmapper）以及最终导航地图部署的完整流程。
+
+---
 
 ## 快速开始
 
+### 1. 环境准备与启动
+在终端中进入项目目录，通过 `uv` 运行 Streamlit 应用：
 ```bash
 cd ~/Workspace/algor_ws/src/mapping_scripts
-uv sync                     # 首次：创建虚拟环境
+uv sync                     # 首次使用：自动同步并创建虚拟环境
 uv run streamlit run app.py --server.port 8501
 ```
 
-浏览器打开 `http://localhost:8501`。
+### 2. 访问界面
+在浏览器中打开：`http://localhost:8501`。
+> [!TIP]
+> 可以在侧边栏（Sidebar）最上方的下拉菜单中随时切换 **中文 (CN)** / **English (EN)** 界面。
 
-## 流程概览
+---
 
-| Step | 内容 |
-|------|------|
-| **Step 0** 初始化 | 显示工作空间和 ROS2 信息，确认开始 |
-| **Step 1** 传感器数据获取 | 启动 Livox 激光雷达、nav_bridge IMU，释放遥控器控制 |
-| **Step 2** 三维点云地图构建 | 启动 PGO SLAM + Rviz，录制 bag，遥控行走建图，自动复制 prior |
-| **Step 3** 栅格地图构建（离线） | 启动重定位 + gridmapper，回放 bag，自动重命名并部署地图文件 |
-| **Step 4** 完成清理 | 停止残留传感器节点，一键重置工作流 |
+## 界面布局说明
 
-## 界面布局
+Web 界面采用三行式仪表盘布局，操作高度解耦，确保前台交互流畅：
 
-页面分为三栏：**侧边栏** | **左栏（Sessions）** | **右栏（Workflow）**
+1. **第一行：工作流步骤（左）与 实时消息（右）**
+   - **左侧 (Step Workflow)**：核心引导步骤。展示当前步骤的控制按钮与状态（如等待话题频率）。
+   - **右侧 (Messages)**：滚动显示系统执行历史与关键输出（如文件生成位置等）。该区域高度固定，支持滚轮向上查看历史，切换步骤时消息不会丢失。
+2. **第二行：后台会话管理 (Sessions)**
+   - 横向列出当前在后台**真实运行**的活跃后台会话。
+   - 提供快捷键按钮：`[停止]`（停止当前会话）、`[重启]`（重新加载该会话）、`[刷新]`（刷新状态）、`[DL Log]`（下载完整文本日志文件）。
+   - 选中某个会话后，会在下方自动以代码块形式显示它实际在后台执行的完整 Shell 命令。
+3. **第三行：会话日志查看器 (Log)**
+   - 实时（每秒自动刷新）展示在第二行中选中的活跃会话的终端最后 200 行输出，便于定位 ROS2 启动失败或运行报错。
+4. **左侧侧边栏**
+   - 提供流程进度指示器、文件路径概览（展开折叠面板可见），以及 **"Abort Mapping"**（一键中止并强力打扫后台进程）。
 
-| 区域 | 内容 |
-|------|------|
-| **侧边栏** | 步骤进度、File Paths（折叠面板）、Abort Mapping（一键停止） |
-| **左栏** | Session 下拉选择 → 状态 + 控制按钮（Stop / Restart / DL Log）→ 日志查看器（auto-refresh 开关）→ 所有 Session 运行状态概览 |
-| **右栏** | 当前步骤消息面板、指令和操作按钮。流程线性推进，无需频繁切页 |
+---
 
-## 详细交互流程
+## 详细建图指导流程
 
-### Step 0 初始化
+### Step 0: 初始化与环境检查
+* 页面加载时自动列出当前 ROS2 环境变量及 Workspace 路径。
+* **刷新防护说明**：如果您在建图途中意外刷新页面回到 Step 0，页面顶部会显示红色警告框，检测出后台有残留进程。您可以点击 **“停止所有并重置 (Stop All & Restart)”** 自动清空后台，或者点击 **“忽略 (Dismiss)”** 继续。
+* 检查完毕后，点击 **"Start Workflow"** 进入第一步。
 
-打开页面后显示工作空间路径和 ROS2 版本信息，点击 **"Start Workflow"** 开始。
+### Step 1: 传感器数据就绪检查
+1. **Start Livox Lidar**：点击按钮启动激光雷达会话。系统会自动在后台以非阻塞方式获取 `/livox/lidar` 的频率，当有数据且频率正常时，显示实时 Hz 并打勾。
+2. **Start nav_bridge**：点击按钮启动 IMU 节点，自动检查 `/imu/data` 频率。
+3. **Release Control**：当两个话题频率均正常后，点击释放底盘控制权。完毕后系统将自动推进到 Step 2。
 
-### Step 1 传感器数据获取
+### Step 2: 三维点云地图构建 (PGO SLAM)
+1. **输入地图名称**：在文本框内定义本次建图的名称（默认为当前时间戳 `sensor_YYMMDD_HHMM`）。
+2. **机器人站立**：操控机器人站立，随后点击 **"Robot is Standing"**。
+3. **启动 SLAM & Rviz**：点击启动 SLAM 节点。系统会在 30s 内自动检测 `/laser_mapping` 节点是否出现。
+4. **开始录制**：点击 **"Start Recording"** 启动 bag 包录制，记录雷达与 IMU 原始话题。
+5. **行走建图**：使用遥控器控制机器人平稳行走进行建图。
+6. **结束建图**：行走完毕后，点击 **"Mapping Complete"**。系统将自动执行：
+   * 停止 bag 录制。
+   * 向 SLAM 节点发送 Ctrl+C 信号以保存点云，并自动等待后台 PGO 算法优化输出完毕（自动检测 `PGO.pcd` 大小稳定无变化）。
+7. **保存点云文件**：检测到 PGO 稳定就绪后，点击按钮将生成的文件复制到 `prior/` 对应地图名目录下。随后自动进入 Step 3。
 
-每个操作自动等待完成后进入下一个指令，无需手动 "Continue"：
+### Step 3: 离线栅格地图构建 (Grid Mapper)
+1. **启动重定位**：点击 **"Start Relocalization"**，系统自动加载刚才保存的 `prior` 点云数据，并等待定位节点就绪。
+2. **启动栅格建图**：点击 **"Start Grid Mapper"**，系统将拉起离线栅格建图工具及 Rviz 界面。
+3. **回放数据包**：点击 **"Start Playback"** 以 `--clock` 模式回放 Step 2 录制的 bag。您可以在前台观察 Rviz 中栅格地图的建立。播放完毕后（或手动点击 "Skip Playback Wait" 提前结束），点击 **"Stop All Nodes"** 停止所有节点。
+4. **生成检查**：系统自动扫描 `map.png`、`map.yaml`、`map_connections.txt`，并在界面上标记 `OK` 或 `MISSING`。
+5. **重命名并部署**：
+   * 点击 **"Rename"**：系统将自动把通用 `map.*` 重命名为专属的 `<map_name>.*` 并更新 YAML 文件内的路径关联。
+   * **GIMP 修正（可选）**：如果您需要用 GIMP 修改栅格地图，请勿改变其分辨率，修改完成后替换原图。
+   * 点击 **"Copy to maps/"** 将生成的地图部署到导航模块中。
+6. **编译导航**：点击 **"Rebuild Now"** 重新编译导航包以让新地图生效。编译命令如下：
+   ```bash
+   colcon build --packages-select multi_map_nav --cmake-args -Wno-dev -DCMAKE_EXPORT_COMPILE_COMMANDS=1 --symlink-install
+   ```
+   编译完成后进入 Step 4。
 
-1. **Start Livox Lidar** → 自动等待 `/livox/lidar` topic 有发布者（20s 超时），显示频率
-2. **Start nav_bridge** → 自动等待 `/imu/data` topic 有发布者（20s 超时），显示频率
-3. **Release Control** → 调用服务释放遥控器控制 → 自动进入 Step 2
+### Step 4: 流程结束与后台清理
+* 界面会扫描当前是否还有残留的后台会话。
+* 点击 **"Stop All Remaining Sessions"** 可一键清理干净。
+* 点击 **"Reset Workflow"** 将重置主页面状态并返回 Step 0。
 
-### Step 2 三维点云地图构建
+---
 
-| # | 操作 | 说明 |
-|---|------|------|
-| 1 | 输入地图名 | 默认 `sensor_YYMMDD_HHMM` |
-| 2 | 遥控站立 → 点击 "Robot is Standing" | |
-| 3 | 点击 "Start SLAM + Rviz" | 自动等待 `laser_mapping` 节点出现（30s 超时） |
-| 4 | 点击 "Start Recording" | 录制 `/livox/lidar` + `/imu/data` |
-| 5 | 遥控行走建图 → 点击 "Mapping Complete" | 一键触发：停止 bag 录制 → SIGINT 停止 SLAM → 等待 PGO 输出 |
-| 6 | 等待 PGO 文件生成 | 自动检测 `PGO.pcd` + `keyframes/` 出现且大小稳定（最长 120s） |
-| 7 | 点击复制按钮 | `PGO.pcd` + `keyframes/` → `prior/<map_name>/` → 自动进入 Step 3 |
+## 常见问题与排查指南
 
-### Step 3 栅格地图构建（离线）
+### 1. 启动 SLAM 或其它节点时提示 "laser_mapping not detected" 并超时闪退？
+* **可能原因**：由于频繁启动和非正常退出，后台可能残留了双叉的 ROS2 孤儿进程，占满了同一个 DDS Domain 下的参与者席位（CycloneDDS 限制）。
+* **排查方法**：在第二行选择异常的会话名（如 `slam`），在下方的日志查看器中查看具体崩溃原因。
+* **解决办法**：点击侧边栏的 **"Abort Mapping"** 或者在第一步/第四步中选择“停止所有”按钮。这会调用系统底层的强力清理机制，强制清杀所有后台残留节点，释放 DDS 资源。
 
-| # | 操作 | 说明 |
-|---|------|------|
-| 1 | 点击 "Start Relocalization" | `prior_dir=<map_name>`，自动等待 `laser_mapping` 节点 |
-| 2 | 点击 "Start Grid Mapper" | 等待 Rviz 加载 → "Rviz Ready" |
-| 3 | 点击 "Start Playback" | `ros2 bag play --clock`，自动检测播放完成，也可 "Skip Playback Wait" 跳过 |
-| 4 | 观察栅格地图 → 点击 "Stop All Nodes" | |
-| 5 | 检查输出文件 | `map.png / map.yaml / map_connections.txt`，标记 OK / MISSING |
-| 6 | 点击 "Proceed to Rename" → "Rename" | 将 `map.*` 重命名为 `<map_name>.*`，更新 yaml 内 image 路径 |
-| 7 | GIMP 编辑 → 点击 "Map Looks Good" | **不可修改分辨率** |
-| 8 | 点击复制到 maps/ | 部署到 `multi_map_nav_ros2/maps/` |
-| 9 | "Rebuild Now" 或 "Skip Rebuild" | 重新编译导航模块 |
+### 2. 我的手动调试会话或数据包播放被杀掉了？
+* **放心运行**：应用内置的强力清理机制已排除了对包含 `ros2 bag` 命令行子进程的匹配。如果您在外部终端通过命令手动播放 bag，它不会被本 Web 界面误杀。
 
-### Step 4 完成清理
-
-显示当前仍在运行的 session，点击 **"Stop All Remaining Sessions"** 一键停止。
-点击 **"Reset Workflow"** 回到 Step 0 重新开始。
-
-## 工作原理
-
-所有后台 ROS2 进程运行在独立的 `screen` 会话中，通过 `tee` 将输出写入日志文件，UI 定期轮询读取。
-
-- `ros2 node list` — 检查节点是否启动
-- `ros2 topic info` — 检查 topic 是否有发布者
-- `ros2 topic hz` — 显示数据频率
-- bag 回放完成检测 — 进程退出自动检测，或手动跳过
-- PGO 文件就绪检测 — 文件出现且大小连续 3 次检查不变才确认
-- Launch 时同名 screen session 已存在会自动清理
-- Session 注册表和 workflow 状态存储在 `st.session_state` 中，页面刷新不丢失
-
-### Session 停止逻辑
-
-参考 `navigate.sh` 的两阶段停止策略：
-
-1. **Phase 1** — 通过 `screen -X stuff '^C'` 发送 Ctrl+C（SIGINT）
-2. **Phase 2** — `screen -X quit` 终止仍存活的 session
-3. **Phase 3** — `kill -9 {PID}` 强制杀死仍未退出的进程
-
-screen 名称匹配使用 `.{name}[[:space:]]` 模式，避免同名前缀冲突（如 `livox` 不会匹配 `livox_backup`）。
-
-## Screen 会话管理
-
-左栏 Session 面板独立于 workflow，可随时查看/停止/重启任意 session：
-
-| 会话名 | 对应节点 |
-|--------|----------|
-| `livox` | Livox 激光雷达 |
-| `nav_bridge` | nav_bridge IMU |
-| `slam` | PGO SLAM + Rviz |
-| `bag_rec` | bag 录制 |
-| `relocal` | 重定位节点 |
-| `gridmapper` | Grid Mapper + Rviz |
-| `bag_play` | bag 回放 |
-| `build` | colcon 编译 |
-
-Launch 时若同名 session 已存在，会自动清理后再启动。
-
-独立调试：
+### 3. 如何在终端手动排查后台会话？
+所有的后台进程均托管在独立的 `screen` 容器中运行，你可以通过终端直接操作：
 ```bash
-screen -r slam          # attach 查看 SLAM 输出
-screen -list            # 查看所有会话
+screen -list            # 查看当前活跃的后台 screen 列表
+screen -r slam          # 直接进入并实时查看 SLAM 进程终端
+# 退出 screen 视图（保持后台运行）：在 screen 界面内按 Ctrl + A，然后按 D
 ```
-
-## 文件路径
-
-```
-faster-slam/
-├── data/PGO_output/          # PGO 建图原始输出
-│   ├── PGO.pcd
-│   └── keyframes/
-├── prior/<map_name>/         # 建图完成后自动复制至此
-│   ├── PGO.pcd
-│   └── keyframes/
-
-gridmapper/data/Output/       # 栅格地图生成输出（初始文件名）
-├── map.png                   # → 重命名为 <map_name>.png
-├── map.yaml                  # → 重命名为 <map_name>.yaml
-└── map_connections.txt
-
-multi_map_nav_ros2/maps/      # 导航模块调用的最终地图目录
-```
-
-## 注意事项
-
-- Step 2 建图过程中确保机器人正面无动态物体，避免"鬼影"
-- Step 3 中若用 GIMP 编辑栅格地图，**不可修改分辨率**
-- 添加新地图文件到 `maps/` 后需重新编译 `multi_map_nav_ros2`
