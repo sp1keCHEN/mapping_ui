@@ -206,7 +206,7 @@ def screen_launch(name: str, cmd: str, cwd: str | None = None) -> str:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = str(LOGS_DIR / f"{name}_{stamp}.log")
-    stdbuf_cmd = f"stdbuf -oL -eL {cmd} 2>&1 | tee -a {log_file}"
+    stdbuf_cmd = f"stdbuf -oL -eL {cmd} > {log_file} 2>&1"
     if cwd:
         # cd first, then run the stdbuf-wrapped command
         full_cmd = f"cd {cwd} && {stdbuf_cmd}"
@@ -359,6 +359,96 @@ def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
         return None
 
 
+def find_package_in_src(workspace_src: Path, pkg_name: str) -> Path | None:
+    # 1. Try standard candidate directory names directly
+    candidates = [pkg_name, pkg_name.replace("_", "-"), pkg_name.replace("-", "_")]
+    if pkg_name == "faster_lio":
+        candidates.append("faster-slam")
+        candidates.append("faster_slam")
+    elif pkg_name == "multi_map_nav":
+        candidates.append("multi_map_nav_ros2")
+        
+    for name in candidates:
+        candidate_path = workspace_src / name
+        if candidate_path.is_dir():
+            return candidate_path
+            
+    # 2. Search up to 3 levels deep for package.xml
+    try:
+        import re
+        for pattern in ["*/package.xml", "*/*/package.xml", "*/*/*/package.xml"]:
+            for p in workspace_src.glob(pattern):
+                try:
+                    content = p.read_text()
+                    if re.search(r'<name>\s*' + re.escape(pkg_name) + r'\s*</name>', content):
+                        return p.parent
+                except Exception:
+                    pass
+    except Exception:
+        pass
+        
+    return None
+
+
+def get_package_share_path(pkg_name: str) -> Path | None:
+    try:
+        prefix = run_ros2_cmd(f"ros2 pkg prefix {pkg_name}", timeout=5)
+        if prefix:
+            prefix_path = Path(prefix.strip())
+            share_path = prefix_path / "share" / pkg_name
+            resolved = share_path.resolve()
+            
+            # If resolved path is in install, try to find the source folder
+            if "install" in resolved.parts:
+                workspace_root = prefix_path.parent.parent
+                workspace_src = workspace_root / "src"
+                if workspace_src.is_dir():
+                    src_path = find_package_in_src(workspace_src, pkg_name)
+                    if src_path:
+                        return src_path
+            return resolved
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_resource
+def get_resolved_paths():
+    faster_lio_share = get_package_share_path("faster_lio")
+    faster_lio = faster_lio_share if faster_lio_share else (ALGOR_WS / "faster-slam")
+    
+    gridmapper_share = get_package_share_path("gridmapper")
+    gridmapper = gridmapper_share if gridmapper_share else (ALGOR_WS / "gridmapper")
+    
+    multi_map_nav_share = get_package_share_path("multi_map_nav")
+    multi_map_nav = multi_map_nav_share if multi_map_nav_share else (ALGOR_WS / "multi_map_nav_ros2")
+    
+    res = {
+        "FASTER_SLAM": faster_lio,
+        "PGO_OUTPUT": faster_lio / "data" / "PGO_output",
+        "PRIOR_DIR": faster_lio / "prior",
+        "GRIDMAPPER_OUTPUT": gridmapper / "data" / "Output",
+        "MAPS_DIR": multi_map_nav / "maps"
+    }
+    
+    print("--- ROS2 Package Path Resolution (Cached) ---")
+    print(f"  FASTER_SLAM: {res['FASTER_SLAM']}")
+    print(f"  PGO_OUTPUT: {res['PGO_OUTPUT']}")
+    print(f"  GRIDMAPPER_OUTPUT: {res['GRIDMAPPER_OUTPUT']}")
+    print(f"  MAPS_DIR: {res['MAPS_DIR']}")
+    print("---------------------------------------------")
+    return res
+
+
+# Resolve directories dynamically at load-time (cached by Streamlit)
+paths = get_resolved_paths()
+FASTER_SLAM = paths["FASTER_SLAM"]
+PGO_OUTPUT = paths["PGO_OUTPUT"]
+PRIOR_DIR = paths["PRIOR_DIR"]
+GRIDMAPPER_OUTPUT = paths["GRIDMAPPER_OUTPUT"]
+MAPS_DIR = paths["MAPS_DIR"]
+
+
 def check_topic_publishers(topic: str) -> int:
     output = run_ros2_cmd(f"ros2 topic info {topic}")
     if not output:
@@ -422,10 +512,10 @@ def get_monitor_manager():
                         continue
 
                     # 3. Only run heavier ros2 topic hz when publisher exists.
-                    # We wrap with timeout --signal=INT 2 so that it exits gracefully via Ctrl+C (SIGINT)
+                    # We wrap with timeout --signal=INT 4 so that it exits gracefully via Ctrl+C (SIGINT)
                     # after 2 seconds, which flushes its stdout buffer naturally.
                     output = run_ros2_cmd(
-                        f"timeout --signal=INT 2 ros2 topic hz {topic} --window 2",
+                        f"timeout --signal=INT 4 ros2 topic hz {topic}",
                         timeout=3,
                     )
                     rate = 0.0
@@ -982,7 +1072,7 @@ def render_step2():
             screen_stop("bag_rec")
             add_message("Bag recording stopped")
             add_message("Stopping SLAM (SIGINT for PGO output)...")
-            screen_stop("slam", graceful=True)
+            _send_ctrl_c("slam")
             st.session_state.current_sub = "wait_pgo"
             st.session_state.wait_start = time.monotonic()
             st.rerun()
@@ -1021,6 +1111,7 @@ def render_step2():
                 st.session_state.pgo_last_size = -1
                 st.session_state.pgo_stable_count = 0
                 add_message("PGO output ready and stable")
+                screen_stop("slam")
                 st.rerun()
 
             st.caption(f"Size stability: {st.session_state.pgo_stable_count} / 3")
@@ -1032,6 +1123,7 @@ def render_step2():
                 add_message("WARN: PGO output not ready after 120s")
             st.session_state.current_sub = "copy_pgo"
             clear_wait_state()
+            screen_stop("slam")
             st.rerun()
 
     # Copy PGO
