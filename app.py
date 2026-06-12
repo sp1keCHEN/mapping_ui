@@ -54,9 +54,6 @@ GRIDMAPPER_LAUNCH_CMD = "ros2 launch gridmapper global.launch.py rviz:=false"
 
 LIVOX_TOPIC = "/livox/lidar"
 IMU_TOPIC = "/imu/data"
-TOPIC_INFO_TIMEOUT_SEC = 1.0
-TOPIC_HZ_SAMPLE_SEC = 2.0
-TOPIC_HZ_TIMEOUT_SEC = 3.5
 PGO_WAIT_TIMEOUT_SEC = 300
 PGO_STABLE_POLLS = 5
 PGO_EXIT_GRACE_SEC = 20
@@ -339,7 +336,7 @@ _init_sessions()
 # ---------------------------------------------------------------------------
 
 
-def run_ros2_cmd(cmd: str, timeout: float = 10) -> str | None:
+def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
     import signal
     try:
         # Force PYTHONUNBUFFERED=1 to ensure that Python-based ROS2 CLI tools
@@ -507,7 +504,7 @@ MAPS_DIR = paths["MAPS_DIR"]
 
 
 def check_topic_publishers(topic: str) -> int:
-    output = run_ros2_cmd(f"ros2 topic info {topic}", timeout=TOPIC_INFO_TIMEOUT_SEC)
+    output = run_ros2_cmd(f"ros2 topic info {topic}")
     if not output:
         return -1
     for line in output.splitlines():
@@ -569,11 +566,11 @@ def get_monitor_manager():
                         continue
 
                     # 3. Only run heavier ros2 topic hz when publisher exists.
-                    # The inner timeout sends SIGINT so ros2 topic hz flushes its summary.
-                    # The outer Python timeout is longer and only catches hung CLI processes.
+                    # We wrap with timeout --signal=INT 4 so that it exits gracefully via Ctrl+C (SIGINT)
+                    # after 2 seconds, which flushes its stdout buffer naturally.
                     output = run_ros2_cmd(
-                        f"timeout --signal=INT {TOPIC_HZ_SAMPLE_SEC:g} ros2 topic hz {topic}",
-                        timeout=TOPIC_HZ_TIMEOUT_SEC,
+                        f"timeout --signal=INT 4 ros2 topic hz {topic}",
+                        timeout=3,
                     )
                     rate = 0.0
                     if output:
