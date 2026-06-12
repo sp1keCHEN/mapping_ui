@@ -33,8 +33,9 @@ if "lang" not in st.session_state:
 # ---------------------------------------------------------------------------
 # Path constants
 # ---------------------------------------------------------------------------
+APP_DIR = Path(__file__).resolve().parent
 HOME = Path.home()
-ALGOR_WS = HOME / "Workspace" / "algor_ws" / "src"
+ALGOR_WS = Path(os.environ.get("MAPPING_UI_WS_SRC", APP_DIR.parent)).expanduser()
 ALGOR_WS_ROOT = ALGOR_WS.parent
 FASTER_SLAM = ALGOR_WS / "faster-slam"
 PGO_OUTPUT = FASTER_SLAM / "data" / "PGO_output"
@@ -53,6 +54,9 @@ GRIDMAPPER_LAUNCH_CMD = "ros2 launch gridmapper global.launch.py rviz:=false"
 
 LIVOX_TOPIC = "/livox/lidar"
 IMU_TOPIC = "/imu/data"
+PGO_WAIT_TIMEOUT_SEC = 300
+PGO_STABLE_POLLS = 5
+PGO_EXIT_GRACE_SEC = 20
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -359,69 +363,117 @@ def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
         return None
 
 
-def find_package_in_src(workspace_src: Path, pkg_name: str) -> Path | None:
-    # 1. Try standard candidate directory names directly
-    candidates = [pkg_name, pkg_name.replace("_", "-"), pkg_name.replace("-", "_")]
-    if pkg_name == "faster_lio":
-        candidates.append("faster-slam")
-        candidates.append("faster_slam")
-    elif pkg_name == "multi_map_nav":
-        candidates.append("multi_map_nav_ros2")
-        
-    for name in candidates:
+PACKAGE_DIR_HINTS = {
+    "faster_lio": ["faster-slam", "faster_lio", "faster_slam"],
+    "gridmapper": ["gridmapper"],
+    "multi_map_nav": ["multi_map_nav_ros2", "multi_map_nav"],
+}
+
+
+def package_dir_candidates(pkg_name: str) -> list[str]:
+    candidates = PACKAGE_DIR_HINTS.get(pkg_name, [])
+    candidates += [pkg_name, pkg_name.replace("_", "-"), pkg_name.replace("-", "_")]
+    return list(dict.fromkeys(candidates))
+
+
+def workspace_src_from_prefix(prefix_path: Path) -> Path | None:
+    """Infer a colcon workspace src directory from merged or isolated install prefixes."""
+    resolved = prefix_path.resolve()
+    if resolved.name == "install":
+        workspace_root = resolved.parent
+    elif resolved.parent.name == "install":
+        workspace_root = resolved.parent.parent
+    elif "install" in resolved.parts:
+        install_idx = resolved.parts.index("install")
+        workspace_root = Path(*resolved.parts[:install_idx])
+    else:
+        return None
+
+    workspace_src = workspace_root / "src"
+    return workspace_src if workspace_src.is_dir() else None
+
+
+def find_package_in_src(workspace_src: Path, pkg_name: str, deep_scan: bool = False) -> Path | None:
+    for name in package_dir_candidates(pkg_name):
         candidate_path = workspace_src / name
         if candidate_path.is_dir():
             return candidate_path
-            
-    # 2. Search up to 3 levels deep for package.xml
+
+    if not deep_scan:
+        return None
+
     try:
-        import re
         for pattern in ["*/package.xml", "*/*/package.xml", "*/*/*/package.xml"]:
             for p in workspace_src.glob(pattern):
                 try:
-                    content = p.read_text()
+                    content = p.read_text(errors="ignore")
                     if re.search(r'<name>\s*' + re.escape(pkg_name) + r'\s*</name>', content):
                         return p.parent
                 except Exception:
                     pass
     except Exception:
         pass
-        
+
     return None
 
 
-def get_package_share_path(pkg_name: str) -> Path | None:
-    try:
-        prefix = run_ros2_cmd(f"ros2 pkg prefix {pkg_name}", timeout=5)
-        if prefix:
-            prefix_path = Path(prefix.strip())
-            share_path = prefix_path / "share" / pkg_name
-            resolved = share_path.resolve()
-            
-            # If resolved path is in install, try to find the source folder
-            if "install" in resolved.parts:
-                workspace_root = prefix_path.parent.parent
-                workspace_src = workspace_root / "src"
-                if workspace_src.is_dir():
-                    src_path = find_package_in_src(workspace_src, pkg_name)
-                    if src_path:
-                        return src_path
-            return resolved
-    except Exception:
-        pass
+def iter_ros_prefixes() -> list[Path]:
+    prefixes: list[Path] = []
+    for env_key in ("AMENT_PREFIX_PATH", "COLCON_PREFIX_PATH"):
+        for item in ROS2_ENV.get(env_key, "").split(os.pathsep):
+            if item:
+                path = Path(item)
+                if path.exists():
+                    prefixes.append(path)
+    return list(dict.fromkeys(prefixes))
+
+
+def workspace_src_candidates() -> list[Path]:
+    candidates = [ALGOR_WS, APP_DIR.parent, Path.cwd().parent]
+    return list(dict.fromkeys(p.resolve() for p in candidates if p.is_dir()))
+
+
+def get_package_path(pkg_name: str) -> Path | None:
+    for workspace_src in workspace_src_candidates():
+        src_path = find_package_in_src(workspace_src, pkg_name)
+        if src_path:
+            return src_path
+
+    for prefix_path in iter_ros_prefixes():
+        resource = prefix_path / "share" / "ament_index" / "resource_index" / "packages" / pkg_name
+        if not resource.exists():
+            continue
+
+        workspace_src = workspace_src_from_prefix(prefix_path)
+        if workspace_src:
+            src_path = find_package_in_src(workspace_src, pkg_name)
+            if src_path:
+                return src_path
+
+        share_path = prefix_path / "share" / pkg_name
+        if share_path.is_dir():
+            return share_path
+
+    for workspace_src in workspace_src_candidates():
+        src_path = find_package_in_src(workspace_src, pkg_name, deep_scan=True)
+        if src_path:
+            return src_path
+
     return None
 
 
 @st.cache_resource
 def get_resolved_paths():
-    faster_lio_share = get_package_share_path("faster_lio")
-    faster_lio = faster_lio_share if faster_lio_share else (ALGOR_WS / "faster-slam")
+    start = time.monotonic()
+
+    faster_lio_path = get_package_path("faster_lio")
+    faster_lio = faster_lio_path if faster_lio_path else (ALGOR_WS / "faster-slam")
     
-    gridmapper_share = get_package_share_path("gridmapper")
-    gridmapper = gridmapper_share if gridmapper_share else (ALGOR_WS / "gridmapper")
+    gridmapper_path = get_package_path("gridmapper")
+    gridmapper = gridmapper_path if gridmapper_path else (ALGOR_WS / "gridmapper")
     
-    multi_map_nav_share = get_package_share_path("multi_map_nav")
-    multi_map_nav = multi_map_nav_share if multi_map_nav_share else (ALGOR_WS / "multi_map_nav_ros2")
+    multi_map_nav_path = get_package_path("multi_map_nav")
+    multi_map_nav = multi_map_nav_path if multi_map_nav_path else (ALGOR_WS / "multi_map_nav_ros2")
     
     res = {
         "FASTER_SLAM": faster_lio,
@@ -436,6 +488,7 @@ def get_resolved_paths():
     print(f"  PGO_OUTPUT: {res['PGO_OUTPUT']}")
     print(f"  GRIDMAPPER_OUTPUT: {res['GRIDMAPPER_OUTPUT']}")
     print(f"  MAPS_DIR: {res['MAPS_DIR']}")
+    print(f"  resolved_in: {time.monotonic() - start:.3f}s")
     print("---------------------------------------------")
     return res
 
@@ -621,6 +674,22 @@ def copy_pgo_to_prior(map_name: str) -> list[str]:
     return messages
 
 
+def archive_existing_pgo_output() -> list[str]:
+    messages = []
+    existing = [p for p in (PGO_OUTPUT / "PGO.pcd", PGO_OUTPUT / "keyframes") if p.exists()]
+    if not existing:
+        return messages
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = PGO_OUTPUT / f"archive_{stamp}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for path in existing:
+        dest = archive_dir / path.name
+        path.rename(dest)
+        messages.append(f"Archived old {path.name} -> {archive_dir}/")
+    return messages
+
+
 # ---------------------------------------------------------------------------
 # Workflow state
 # ---------------------------------------------------------------------------
@@ -647,6 +716,7 @@ def _init_state():
         "step1_imu_hz": 0.0,
         "pgo_last_size": -1,
         "pgo_stable_count": 0,
+        "pgo_files_stable_at": None,
         "selected_session": KNOWN_SESSIONS[0]["name"],
         "action_in_progress": False,
         "last_sub": "start",
@@ -686,6 +756,21 @@ def file_size_human(p: Path) -> str:
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
     return f"{size / 1024 / 1024:.1f} MB"
+
+
+def path_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except OSError:
+            pass
+    return total
 
 
 def step_status(step_id: int) -> str:
@@ -1008,6 +1093,8 @@ def render_step2():
         st.markdown(t("s2_start_slam_desc"))
         if st.button(t("s2_start_slam"), type="primary", key="btn_s2_slam", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
+            for m in archive_existing_pgo_output():
+                add_message(m)
             add_message("Starting SLAM with PGO + Rviz...")
             screen_launch("slam", SLAM_PGO_LAUNCH_CMD)
             st.session_state.current_sub = "wait_slam"
@@ -1072,7 +1159,14 @@ def render_step2():
             screen_stop("bag_rec")
             add_message("Bag recording stopped")
             add_message("Stopping SLAM (SIGINT for PGO output)...")
-            _send_ctrl_c("slam")
+            if _session_alive("slam"):
+                _send_ctrl_c("slam")
+                add_message("Sent SIGINT to SLAM; waiting for PGO files to finish writing")
+            else:
+                add_message("WARN: SLAM session is already stopped")
+            st.session_state.pgo_last_size = -1
+            st.session_state.pgo_stable_count = 0
+            st.session_state.pgo_files_stable_at = None
             st.session_state.current_sub = "wait_pgo"
             st.session_state.wait_start = time.monotonic()
             st.rerun()
@@ -1080,15 +1174,16 @@ def render_step2():
     # Wait for PGO
     if sub == "wait_pgo":
         elapsed = time.monotonic() - get_wait_start()
-        st.progress(min(elapsed / 120, 1.0))
-        st.caption(f"Waiting for PGO output... ({elapsed:.0f}s / 120s)")
+        st.progress(min(elapsed / PGO_WAIT_TIMEOUT_SEC, 1.0))
+        st.caption(f"Waiting for PGO output... ({elapsed:.0f}s / {PGO_WAIT_TIMEOUT_SEC}s)")
 
         pgo_pcd = PGO_OUTPUT / "PGO.pcd"
         pgo_kf = PGO_OUTPUT / "keyframes"
         pcd_exists = pgo_pcd.exists()
         kf_exists = pgo_kf.is_dir()
+        slam_alive = _session_alive("slam")
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             if pcd_exists:
                 st.markdown(f"**PGO.pcd:** OK ({file_size_human(pgo_pcd)})")
@@ -1096,34 +1191,48 @@ def render_step2():
                 st.markdown("**PGO.pcd:** waiting...")
         with c2:
             st.markdown(f"**keyframes/**: {'OK' if kf_exists else 'waiting...'}")
+        with c3:
+            st.markdown(f"**SLAM:** {'writing/exiting' if slam_alive else 'stopped'}")
 
         if pcd_exists and kf_exists:
-            cur_size = pgo_pcd.stat().st_size
+            cur_size = pgo_pcd.stat().st_size + path_size_bytes(pgo_kf)
             if cur_size == st.session_state.pgo_last_size and cur_size > 0:
                 st.session_state.pgo_stable_count += 1
             elif cur_size > 0:
                 st.session_state.pgo_last_size = cur_size
                 st.session_state.pgo_stable_count = 0
 
-            if st.session_state.pgo_stable_count >= 3:
+            files_stable = st.session_state.pgo_stable_count >= PGO_STABLE_POLLS
+            if files_stable and st.session_state.pgo_files_stable_at is None:
+                st.session_state.pgo_files_stable_at = time.monotonic()
+                add_message("PGO files are stable; waiting for SLAM session to exit cleanly")
+
+            stable_at = st.session_state.pgo_files_stable_at
+            exit_grace_elapsed = stable_at is not None and (time.monotonic() - stable_at) >= PGO_EXIT_GRACE_SEC
+            if files_stable and (not slam_alive or exit_grace_elapsed):
                 st.session_state.current_sub = "copy_pgo"
                 clear_wait_state()
                 st.session_state.pgo_last_size = -1
                 st.session_state.pgo_stable_count = 0
+                st.session_state.pgo_files_stable_at = None
                 add_message("PGO output ready and stable")
-                screen_stop("slam")
                 st.rerun()
 
-            st.caption(f"Size stability: {st.session_state.pgo_stable_count} / 3")
+            st.caption(f"Size stability: {st.session_state.pgo_stable_count} / {PGO_STABLE_POLLS}")
+            if files_stable and slam_alive:
+                st.info("PGO files are stable; keeping the SLAM screen alive briefly so it can exit on its own.")
             pass  # fragment auto-reruns every 1s
-        elif elapsed >= 120:
+        elif elapsed >= PGO_WAIT_TIMEOUT_SEC:
             if pcd_exists and kf_exists:
                 add_message("WARN: PGO output found but size still changing")
             else:
-                add_message("WARN: PGO output not ready after 120s")
+                add_message(f"WARN: PGO output not ready after {PGO_WAIT_TIMEOUT_SEC}s")
             st.session_state.current_sub = "copy_pgo"
             clear_wait_state()
-            screen_stop("slam")
+            st.session_state.pgo_last_size = -1
+            st.session_state.pgo_stable_count = 0
+            st.session_state.pgo_files_stable_at = None
+            add_message("Leaving SLAM session untouched to avoid interrupting late PGO writes")
             st.rerun()
 
     # Copy PGO
@@ -1139,6 +1248,9 @@ def render_step2():
                 msgs = copy_pgo_to_prior(map_name)
                 for m in msgs:
                     add_message(m)
+                if not any(m.startswith("ERROR:") for m in msgs) and _session_alive("slam"):
+                    add_message("PGO copied; stopping old SLAM session")
+                    screen_stop("slam")
                 bag_dir = find_bag_dir(st.session_state.bag_name)
                 st.session_state.bag_dir = bag_dir
                 if bag_dir:
@@ -1461,7 +1573,7 @@ def render_step4():
             workflow_keys = [
                 "current_step", "current_sub", "map_name", "bag_name",
                 "bag_dir", "step_messages", "step1_livox_hz", "step1_imu_hz",
-                "pgo_last_size", "pgo_stable_count",
+                "pgo_last_size", "pgo_stable_count", "pgo_files_stable_at",
             ]
             for k in workflow_keys:
                 if k in st.session_state:
