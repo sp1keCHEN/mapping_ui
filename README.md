@@ -1,4 +1,4 @@
-# ROS2 自动化建图工具用户手册 (Mapping Scripts)
+# ROS2 自动化建图工具用户手册 (Mapping UI)
 
 这是一个交互式的 ROS2 建图辅助 Web 工具，旨在引导操作人员完成从雷达/IMU启动、三维点云建图（faster-lio PGO）、数据包录制，到离线栅格地图生成（gridmapper）以及最终导航地图部署的完整流程。
 
@@ -9,10 +9,17 @@
 ### 1. 环境准备与启动
 在终端中进入项目目录，通过 `uv` 运行 Streamlit 应用：
 ```bash
-cd ~/Workspace/algor_ws/src/mapping_scripts
+cd ~/Workspace/algor_ws/src/mapping_UI
 uv sync                     # 首次使用：自动同步并创建虚拟环境
 uv run streamlit run app.py --server.port 8501
 ```
+
+如果板卡或部署设备上的 workspace 路径不同，可以显式指定 `src` 目录：
+```bash
+MAPPING_UI_WS_SRC=/path/to/algor_ws/src uv run streamlit run app.py --server.port 8501
+```
+
+应用启动时会优先从当前项目所在 workspace、`AMENT_PREFIX_PATH` / `COLCON_PREFIX_PATH` 的 ament index 中快速解析 `faster_lio`、`gridmapper`、`multi_map_nav` 等包路径；只有快速路径失败时才会有限扫描 `package.xml`。
 
 ### 2. 访问界面
 在浏览器中打开：`http://localhost:8501`。
@@ -43,29 +50,39 @@ Web 界面采用三行式仪表盘布局，操作高度解耦，确保前台交�
 
 ### Step 0: 初始化与环境检查
 * 页面加载时自动列出当前 ROS2 环境变量及 Workspace 路径。
+* 包路径会根据当前设备动态解析，页面文件路径面板会显示实际使用的 `PGO output`、`prior`、`gridmapper output` 和 `maps` 目录。
 * **刷新防护说明**：如果您在建图途中意外刷新页面回到 Step 0，页面顶部会显示红色警告框，检测出后台有残留进程。您可以点击 **“停止所有并重置 (Stop All & Restart)”** 自动清空后台，或者点击 **“忽略 (Dismiss)”** 继续。
 * 检查完毕后，点击 **"Start Workflow"** 进入第一步。
 
 ### Step 1: 传感器数据就绪检查
 1. **Start Livox Lidar**：点击按钮启动激光雷达会话。系统会自动在后台以非阻塞方式获取 `/livox/lidar` 的频率，当有数据且频率正常时，显示实时 Hz 并打勾。
 2. **Start nav_bridge**：点击按钮启动 IMU 节点，自动检查 `/imu/data` 频率。
+   * 话题检测会先快速检查 publisher，再短时间采样 `ros2 topic hz`。这样可以避免 ROS2 CLI 卡住页面，同时仍然要求实际解析到 `average rate` 后才判定话题有效。
 3. **Release Control**：当两个话题频率均正常后，点击释放底盘控制权。完毕后系统将自动推进到 Step 2。
 
 ### Step 2: 三维点云地图构建 (PGO SLAM)
-1. **输入地图名称**：在文本框内定义本次建图的名称（默认为当前时间戳 `sensor_YYMMDD_HHMM`）。
+1. **确认地图名称**：在文本框内定义本次建图的名称（默认为当前时间戳 `sensor_YYMMDD_HHMM`），然后点击 **"Confirm Map Name / 确认地图名称"**。
+   * 地图名必须满足：1-48 个字符，只能包含英文字母、数字、下划线 `_`、短横线 `-`，且首字符必须是字母或数字。
+   * 合法示例：`factory-A-01`、`company_floor1`、`sensor_260612_1530`。
+   * 不建议/不允许使用空格、中文、斜杠、点号、引号、分号、`$()` 等字符。地图名会传递到 bag 名称、`prior` 目录、重定位参数、栅格地图文件名和导航 maps 目录。
 2. **机器人站立**：操控机器人站立，随后点击 **"Robot is Standing"**。
-3. **启动 SLAM & Rviz**：点击启动 SLAM 节点。系统会在 30s 内自动检测 `/laser_mapping` 节点是否出现。
+3. **启动 SLAM**：点击启动 SLAM 节点。系统会在 30s 内自动检测 `/laser_mapping` 节点是否出现。
+   * 启动新 SLAM 前，若 `PGO_output` 中已有旧的 `PGO.pcd` 或 `keyframes/`，系统会先将其归档到 `archive_YYYYMMDD_HHMMSS/`，避免误读上一轮输出。
 4. **开始录制**：点击 **"Start Recording"** 启动 bag 包录制，记录雷达与 IMU 原始话题。
+   * Bag 名称为 `<map_name>_sensor`，保存于 `~/bags/`。
 5. **行走建图**：使用遥控器控制机器人平稳行走进行建图。
 6. **结束建图**：行走完毕后，点击 **"Mapping Complete"**。系统将自动执行：
    * 停止 bag 录制。
-   * 向 SLAM 节点发送 Ctrl+C 信号以保存点云，并自动等待后台 PGO 算法优化输出完毕（自动检测 `PGO.pcd` 大小稳定无变化）。
+   * 仅向 SLAM 节点发送一次 Ctrl+C 信号以触发 PGO 保存。
+   * 自动等待 `PGO.pcd` 和 `keyframes/` 总体大小连续稳定，并优先等待 SLAM screen 自然退出。文件未稳定前不会主动强杀 `slam` screen，避免板卡上写盘较慢导致 `PGO.pcd` 未完整输出。
 7. **保存点云文件**：检测到 PGO 稳定就绪后，点击按钮将生成的文件复制到 `prior/` 对应地图名目录下。随后自动进入 Step 3。
+   * 复制成功后，系统才会清理旧的 `slam` 会话，避免影响下一步重定位。
 
 ### Step 3: 离线栅格地图构建 (Grid Mapper)
 1. **启动重定位**：点击 **"Start Relocalization"**，系统自动加载刚才保存的 `prior` 点云数据，并等待定位节点就绪。
-2. **启动栅格建图**：点击 **"Start Grid Mapper"**，系统将拉起离线栅格建图工具及 Rviz 界面。
-3. **回放数据包**：点击 **"Start Playback"** 以 `--clock` 模式回放 Step 2 录制的 bag。您可以在前台观察 Rviz 中栅格地图的建立。播放完毕后（或手动点击 "Skip Playback Wait" 提前结束），点击 **"Stop All Nodes"** 停止所有节点。
+   * 实际启动命令会使用 `prior_dir:=<map_name>`。
+2. **启动栅格建图**：点击 **"Start Grid Mapper"**，系统将拉起离线栅格建图工具。
+3. **回放数据包**：点击 **"Start Playback"** 以 `--clock` 模式回放 Step 2 录制的 bag。播放完毕后（或手动点击 "Skip Playback Wait" 提前结束），点击 **"Stop All Nodes"** 停止所有节点。
 4. **生成检查**：系统自动扫描 `map.png`、`map.yaml`、`map_connections.txt`，并在界面上标记 `OK` 或 `MISSING`。
 5. **重命名并部署**：
    * 点击 **"Rename"**：系统将自动把通用 `map.*` 重命名为专属的 `<map_name>.*` 并更新 YAML 文件内的路径关联。
@@ -86,15 +103,33 @@ Web 界面采用三行式仪表盘布局，操作高度解耦，确保前台交�
 
 ## 常见问题与排查指南
 
-### 1. 启动 SLAM 或其它节点时提示 "laser_mapping not detected" 并超时闪退？
+### 1. 地图名称会影响哪些文件？
+假设确认的地图名为 `<map_name>`，系统会按以下规则传递：
+
+| 用途 | 实际名称 / 路径 |
+| --- | --- |
+| Bag 录制目录 | `~/bags/<map_name>_sensor/` |
+| PGO prior 目录 | `faster-slam/prior/<map_name>/` |
+| 重定位参数 | `prior_dir:=<map_name>` |
+| 栅格地图文件 | `<map_name>.png`、`<map_name>.yaml`、`<map_name>.txt` |
+| 导航 maps 部署 | `multi_map_nav_ros2/maps/<map_name>.png`、`<map_name>.yaml` |
+
+因此地图名必须保持简单稳定，避免特殊字符造成 shell 命令、ROS launch 参数或文件路径解析失败。
+
+### 2. 启动 SLAM 或其它节点时提示 "laser_mapping not detected" 并超时闪退？
 * **可能原因**：由于频繁启动和非正常退出，后台可能残留了双叉的 ROS2 孤儿进程，占满了同一个 DDS Domain 下的参与者席位（CycloneDDS 限制）。
 * **排查方法**：在第二行选择异常的会话名（如 `slam`），在下方的日志查看器中查看具体崩溃原因。
 * **解决办法**：点击侧边栏的 **"Abort Mapping"** 或者在第一步/第四步中选择“停止所有”按钮。这会调用系统底层的强力清理机制，强制清杀所有后台残留节点，释放 DDS 资源。
 
-### 2. 我的手动调试会话或数据包播放被杀掉了？
+### 3. PGO.pcd 一直没有出现怎么办？
+* **先看日志**：在会话管理中选择 `slam`，查看是否仍在做 PGO 优化或写文件。
+* **不要手动强杀 slam screen**：系统在发送 Ctrl+C 后会等待文件稳定，过早杀掉 screen 可能导致 `PGO.pcd` 没有完整写出。
+* **检查归档目录**：新一轮 SLAM 启动前，旧的 `PGO.pcd` 和 `keyframes/` 会被移动到 `PGO_output/archive_YYYYMMDD_HHMMSS/`，避免误用旧结果。
+
+### 4. 我的手动调试会话或数据包播放被杀掉了？
 * **放心运行**：应用内置的强力清理机制已排除了对包含 `ros2 bag` 命令行子进程的匹配。如果您在外部终端通过命令手动播放 bag，它不会被本 Web 界面误杀。
 
-### 3. 如何在终端手动排查后台会话？
+### 5. 如何在终端手动排查后台会话？
 所有的后台进程均托管在独立的 `screen` 容器中运行，你可以通过终端直接操作：
 ```bash
 screen -list            # 查看当前活跃的后台 screen 列表

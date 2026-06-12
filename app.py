@@ -54,9 +54,13 @@ GRIDMAPPER_LAUNCH_CMD = "ros2 launch gridmapper global.launch.py rviz:=false"
 
 LIVOX_TOPIC = "/livox/lidar"
 IMU_TOPIC = "/imu/data"
+TOPIC_INFO_TIMEOUT_SEC = 1.0
+TOPIC_HZ_SAMPLE_SEC = 2.0
+TOPIC_HZ_TIMEOUT_SEC = 3.5
 PGO_WAIT_TIMEOUT_SEC = 300
 PGO_STABLE_POLLS = 5
 PGO_EXIT_GRACE_SEC = 20
+MAP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -335,7 +339,7 @@ _init_sessions()
 # ---------------------------------------------------------------------------
 
 
-def run_ros2_cmd(cmd: str, timeout: int = 10) -> str | None:
+def run_ros2_cmd(cmd: str, timeout: float = 10) -> str | None:
     import signal
     try:
         # Force PYTHONUNBUFFERED=1 to ensure that Python-based ROS2 CLI tools
@@ -503,7 +507,7 @@ MAPS_DIR = paths["MAPS_DIR"]
 
 
 def check_topic_publishers(topic: str) -> int:
-    output = run_ros2_cmd(f"ros2 topic info {topic}")
+    output = run_ros2_cmd(f"ros2 topic info {topic}", timeout=TOPIC_INFO_TIMEOUT_SEC)
     if not output:
         return -1
     for line in output.splitlines():
@@ -565,11 +569,11 @@ def get_monitor_manager():
                         continue
 
                     # 3. Only run heavier ros2 topic hz when publisher exists.
-                    # We wrap with timeout --signal=INT 4 so that it exits gracefully via Ctrl+C (SIGINT)
-                    # after 2 seconds, which flushes its stdout buffer naturally.
+                    # The inner timeout sends SIGINT so ros2 topic hz flushes its summary.
+                    # The outer Python timeout is longer and only catches hung CLI processes.
                     output = run_ros2_cmd(
-                        f"timeout --signal=INT 4 ros2 topic hz {topic}",
-                        timeout=3,
+                        f"timeout --signal=INT {TOPIC_HZ_SAMPLE_SEC:g} ros2 topic hz {topic}",
+                        timeout=TOPIC_HZ_TIMEOUT_SEC,
                     )
                     rate = 0.0
                     if output:
@@ -747,6 +751,10 @@ def get_wait_start():
 def clear_wait_state():
     if "wait_start" in st.session_state:
         del st.session_state.wait_start
+
+
+def is_valid_map_name(name: str) -> bool:
+    return bool(MAP_NAME_RE.fullmatch(name))
 
 
 def file_size_human(p: Path) -> str:
@@ -1063,7 +1071,7 @@ def render_step1():
             )
             add_message(f"Control released: {output or 'OK'}")
             st.session_state.current_step = 2
-            st.session_state.current_sub = "stand_up"
+            st.session_state.current_sub = "confirm_name"
             if not st.session_state.map_name:
                 st.session_state.map_name = datetime.now().strftime("sensor_%y%m%d_%H%M")
             st.rerun()
@@ -1078,6 +1086,23 @@ def render_step2():
         t("s2_map_name"), value=st.session_state.map_name, key="map_name_input",
     )
     st.session_state.map_name = map_name
+
+    # Confirm map name
+    if sub == "confirm_name":
+        st.warning(t("s2_name_notice"))
+        st.markdown(f"**Current map name:** `{map_name or '(empty)'}`")
+        if st.button(t("s2_confirm_name"), type="primary", key="btn_s2_confirm_name", disabled=st.session_state.action_in_progress):
+            clean_name = map_name.strip()
+            if not clean_name:
+                st.error(t("s2_name_empty"))
+            elif not is_valid_map_name(clean_name):
+                st.error(t("s2_name_invalid"))
+            else:
+                st.session_state.action_in_progress = True
+                st.session_state.map_name = clean_name
+                add_message(t("s2_name_confirmed", name=st.session_state.map_name))
+                st.session_state.current_sub = "stand_up"
+                st.rerun()
 
     # Stand up
     if sub == "stand_up":
