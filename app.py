@@ -616,6 +616,46 @@ def find_bag_dir(bag_name: str) -> str | None:
     return None
 
 
+def get_bag_duration_sec(bag_dir: str | None) -> float | None:
+    if not bag_dir:
+        return None
+    metadata = Path(bag_dir) / "metadata.yaml"
+    if not metadata.exists():
+        return None
+    try:
+        with metadata.open("r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read(65536).splitlines()
+    except OSError:
+        return None
+
+    in_duration = False
+    duration_indent = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        if stripped.startswith("duration:"):
+            value = stripped.split(":", 1)[1].strip()
+            if value.isdigit():
+                return int(value) / 1_000_000_000
+            in_duration = True
+            duration_indent = indent
+            continue
+
+        if in_duration:
+            if indent <= duration_indent and not stripped.startswith("nanoseconds:"):
+                in_duration = False
+                continue
+            if stripped.startswith("nanoseconds:"):
+                value = stripped.split(":", 1)[1].strip()
+                if value.isdigit():
+                    return int(value) / 1_000_000_000
+
+    return None
+
+
 def rename_grid_map(old_name: str, new_name: str) -> list[str]:
     messages = []
     for ext in (".png", ".yaml", ".txt"):
@@ -712,6 +752,8 @@ def _init_state():
         "map_name": "",
         "bag_name": "",
         "bag_dir": None,
+        "playback_started_at": None,
+        "playback_duration_sec": None,
         "step_messages": [],
         "step1_livox_hz": 0.0,
         "step1_imu_hz": 0.0,
@@ -754,6 +796,17 @@ def is_valid_map_name(name: str) -> bool:
     return bool(MAP_NAME_RE.fullmatch(name))
 
 
+def format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = max(0, int(round(seconds)))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:d}:{sec:02d}"
+
+
 def file_size_human(p: Path) -> str:
     size = p.stat().st_size
     if size < 1024:
@@ -784,6 +837,17 @@ def step_status(step_id: int) -> str:
     if st.session_state.current_step == step_id:
         return "running"
     return "not_started"
+
+
+def sync_action_lock() -> None:
+    """Release button lock after a workflow step/sub-step transition."""
+    if "last_sub" not in st.session_state or st.session_state.last_sub != st.session_state.current_sub:
+        st.session_state.last_sub = st.session_state.current_sub
+        st.session_state.action_in_progress = False
+
+    if "last_step" not in st.session_state or st.session_state.last_step != st.session_state.current_step:
+        st.session_state.last_step = st.session_state.current_step
+        st.session_state.action_in_progress = False
 
 
 # ---------------------------------------------------------------------------
@@ -1373,7 +1437,10 @@ def render_step3():
                 st.session_state.action_in_progress = True
                 add_message(f"Playing bag '{bag_dir}' with --clock...")
                 cmd = f"ros2 bag play {bag_dir} --clock"
+                duration_sec = get_bag_duration_sec(bag_dir)
                 screen_launch("bag_play", cmd)
+                st.session_state.playback_started_at = time.monotonic()
+                st.session_state.playback_duration_sec = duration_sec
                 st.session_state.current_sub = "wait_playback"
                 st.rerun()
         else:
@@ -1388,14 +1455,32 @@ def render_step3():
         play_alive = _session_alive("bag_play")
         if play_alive:
             st.markdown("**Bag playback in progress...**")
+            started_at = st.session_state.get("playback_started_at")
+            duration_sec = st.session_state.get("playback_duration_sec")
+            if started_at and duration_sec:
+                elapsed = max(0.0, time.monotonic() - started_at)
+                remaining = max(0.0, duration_sec - elapsed)
+                progress = min(elapsed / duration_sec, 1.0)
+                st.progress(progress)
+                st.caption(
+                    f"Elapsed: {format_duration(elapsed)} / {format_duration(duration_sec)} "
+                    f"· Remaining: ~{format_duration(remaining)}"
+                )
+            else:
+                st.progress(0.0)
+                st.caption("Bag duration unavailable; showing live log only.")
             log_tail = screen_read_log("bag_play", max_lines=5)
             st.code(log_tail, language="text")
             if st.button("Skip Playback Wait", key="btn_s3_skip_play"):
+                st.session_state.playback_started_at = None
+                st.session_state.playback_duration_sec = None
                 st.session_state.current_sub = "observe"
                 st.rerun()
             pass  # fragment auto-reruns every 1s
         else:
             add_message("Bag playback finished")
+            st.session_state.playback_started_at = None
+            st.session_state.playback_duration_sec = None
             st.session_state.current_sub = "observe"
             st.rerun()
 
@@ -1594,7 +1679,8 @@ def render_step4():
             # Reset only workflow state, keep sessions registry
             workflow_keys = [
                 "current_step", "current_sub", "map_name", "bag_name",
-                "bag_dir", "step_messages", "step1_livox_hz", "step1_imu_hz",
+                "bag_dir", "playback_started_at", "playback_duration_sec",
+                "step_messages", "step1_livox_hz", "step1_imu_hz",
                 "pgo_last_size", "pgo_stable_count", "pgo_files_stable_at",
             ]
             for k in workflow_keys:
@@ -1610,14 +1696,7 @@ def render_step4():
 
 
 def main():
-    # Track sub-step changes to clear click lock
-    if "last_sub" not in st.session_state or st.session_state.last_sub != st.session_state.current_sub:
-        st.session_state.last_sub = st.session_state.current_sub
-        st.session_state.action_in_progress = False
-
-    if "last_step" not in st.session_state or st.session_state.last_step != st.session_state.current_step:
-        st.session_state.last_step = st.session_state.current_step
-        st.session_state.action_in_progress = False
+    sync_action_lock()
 
     st.title(t("page_title"))
     render_sidebar()
@@ -1662,6 +1741,7 @@ def main():
     with step_col:
         @st.fragment(run_every=1)
         def _step_fragment():
+            sync_action_lock()
             step_renderers = {
                 0: render_step0,
                 1: render_step1,

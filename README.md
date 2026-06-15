@@ -82,7 +82,7 @@ Web 界面采用三行式仪表盘布局，操作高度解耦，确保前台交�
 1. **启动重定位**：点击 **"Start Relocalization"**，系统自动加载刚才保存的 `prior` 点云数据，并等待定位节点就绪。
    * 实际启动命令会使用 `prior_dir:=<map_name>`。
 2. **启动栅格建图**：点击 **"Start Grid Mapper"**，系统将拉起离线栅格建图工具。
-3. **回放数据包**：点击 **"Start Playback"** 以 `--clock` 模式回放 Step 2 录制的 bag。播放完毕后（或手动点击 "Skip Playback Wait" 提前结束），点击 **"Stop All Nodes"** 停止所有节点。
+3. **回放数据包**：点击 **"Start Playback"** 以 `--clock` 模式回放 Step 2 录制的 bag。系统会读取 bag 的 `metadata.yaml` 并显示预计总时长、已播放时间、剩余时间和进度条；播放完毕后（或手动点击 "Skip Playback Wait" 提前结束），点击 **"Stop All Nodes"** 停止所有节点。
 4. **生成检查**：系统自动扫描 `map.png`、`map.yaml`、`map_connections.txt`，并在界面上标记 `OK` 或 `MISSING`。
 5. **重命名并部署**：
    * 点击 **"Rename"**：系统将自动把通用 `map.*` 重命名为专属的 `<map_name>.*` 并更新 YAML 文件内的路径关联。
