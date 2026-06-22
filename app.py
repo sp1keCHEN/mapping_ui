@@ -132,6 +132,7 @@ KNOWN_SESSIONS = [
 
 SESSION_LABEL = {s["name"]: s["label"] for s in KNOWN_SESSIONS}
 SESSION_NAMES = [s["name"] for s in KNOWN_SESSIONS]
+SCREEN_LIVE_STATES = ("Attached", "Detached", "Multi")
 
 
 def _init_sessions():
@@ -147,17 +148,46 @@ def _get_session(name: str) -> dict | None:
     return st.session_state.sessions.get(name)
 
 
-def _session_alive(name: str) -> bool:
-    """Check if a screen session is running.
+def _screen_wipe_dead() -> None:
+    """Remove dead screen sockets left behind after crashes or force kills."""
+    try:
+        subprocess.run(
+            ["screen", "-wipe"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        pass
 
-    Uses `.{name}[[:space:]]` pattern to avoid matching similar names
-    (e.g. `livox` should not match `livox_backup`).
-    """
-    result = subprocess.run(
-        f"screen -list | grep -q '\\.{name}[[:space:]]'",
-        shell=True, capture_output=True,
-    )
-    return result.returncode == 0
+
+def _screen_entries(wipe_dead: bool = True) -> list[dict[str, str]]:
+    """Parse `screen -ls`, optionally cleaning stale `Dead ???` sockets first."""
+    if wipe_dead:
+        _screen_wipe_dead()
+    try:
+        result = subprocess.run(
+            ["screen", "-ls"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return []
+
+    entries: list[dict[str, str]] = []
+    pattern = re.compile(r"^\s*(\d+)\.([^\s]+)\s+.*\(([^)]*)\)")
+    for line in result.stdout.splitlines():
+        m = pattern.match(line)
+        if not m:
+            continue
+        state = m.group(3)
+        entries.append({"pid": m.group(1), "name": m.group(2), "state": state})
+    return entries
+
+
+def _session_alive(name: str) -> bool:
+    """Check whether a screen session is live, ignoring stale `Dead ???` sockets."""
+    for entry in _screen_entries():
+        if entry["name"] == name and any(state in entry["state"] for state in SCREEN_LIVE_STATES):
+            return True
+    return False
 
 
 def _screen_quit(name: str) -> None:
@@ -170,31 +200,25 @@ def _screen_quit(name: str) -> None:
 
 def _force_kill(name: str) -> None:
     try:
-        result = subprocess.run(
-            f"screen -list | grep '\\.{name}[[:space:]]' | awk -F. '{{print $1}}'",
-            shell=True, capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.strip().splitlines():
-            pid = line.strip()
-            if pid and pid.isdigit():
-                try:
-                    script = f"""
-                    kill_tree() {{
-                        local parent=$1
-                        local children=$(pgrep -P $parent)
-                        for child in $children; do
-                            kill_tree $child
-                        done
-                        kill -9 $parent 2>/dev/null
-                    }}
-                    kill_tree {pid}
-                    """
-                    subprocess.run(script, shell=True, executable='/bin/bash', timeout=5)
-                except Exception:
-                    pass
+        for entry in _screen_entries():
+            pid = entry["pid"]
+            if entry["name"] == name and pid.isdigit():
+                script = f"""
+                kill_tree() {{
+                    local parent=$1
+                    local children=$(pgrep -P $parent)
+                    for child in $children; do
+                        kill_tree $child
+                    done
+                    kill -9 $parent 2>/dev/null
+                }}
+                kill_tree {pid}
+                """
+                subprocess.run(script, shell=True, executable='/bin/bash', timeout=5)
     except Exception:
         pass
     time.sleep(0.3)
+    _screen_wipe_dead()
 
 
 def _send_ctrl_c(name: str) -> None:
@@ -273,6 +297,7 @@ def screen_stop_all() -> None:
     for name in list(st.session_state.sessions.keys()):
         _force_kill(name)
     clean_orphans()
+    _screen_wipe_dead()
 
 
 # ANSI escape sequence removal
@@ -665,7 +690,7 @@ def rename_grid_map(old_name: str, new_name: str) -> list[str]:
             if new_path.exists():
                 new_path.unlink()
             old_path.rename(new_path)
-            messages.append(f"Renamed {old_path.name} -> {new_path.name}")
+            messages.append(t("msg_renamed", old=old_path.name, new=new_path.name))
     yaml_path = GRIDMAPPER_OUTPUT / f"{new_name}.yaml"
     if yaml_path.exists():
         content = yaml_path.read_text()
@@ -677,7 +702,7 @@ def rename_grid_map(old_name: str, new_name: str) -> list[str]:
         )
         if fixed != content:
             yaml_path.write_text(fixed)
-            messages.append(f"Updated image path in {new_name}.yaml")
+            messages.append(t("msg_yaml_updated", name=new_name))
     return messages
 
 
@@ -688,11 +713,11 @@ def copy_grid_map(map_name: str) -> list[str]:
         src = GRIDMAPPER_OUTPUT / f"{map_name}{ext}"
         if src.exists():
             shutil.copy2(src, MAPS_DIR / src.name)
-            messages.append(f"Copied {src.name} -> {MAPS_DIR}/")
+            messages.append(t("msg_copied_to", name=src.name, dest=MAPS_DIR))
     conn_src = GRIDMAPPER_OUTPUT / "map_connections.txt"
     if conn_src.exists():
         shutil.copy2(conn_src, MAPS_DIR / conn_src.name)
-        messages.append(f"Copied map_connections.txt -> {MAPS_DIR}/")
+        messages.append(t("msg_copied_to", name="map_connections.txt", dest=MAPS_DIR))
     return messages
 
 
@@ -701,17 +726,17 @@ def copy_pgo_to_prior(map_name: str) -> list[str]:
     pgo_pcd = PGO_OUTPUT / "PGO.pcd"
     pgo_kf = PGO_OUTPUT / "keyframes"
     if not pgo_pcd.exists():
-        return [f"ERROR: {pgo_pcd} not found"]
+        return [t("msg_error_not_found", path=pgo_pcd)]
     if not pgo_kf.is_dir():
-        return [f"ERROR: {pgo_kf} not found"]
+        return [t("msg_error_not_found", path=pgo_kf)]
     dest = PRIOR_DIR / map_name
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy2(pgo_pcd, dest / "PGO.pcd")
-    messages.append(f"Copied PGO.pcd -> {dest}/")
+    messages.append(t("msg_copied_to", name="PGO.pcd", dest=dest))
     if (dest / "keyframes").exists():
         shutil.rmtree(dest / "keyframes")
     shutil.copytree(pgo_kf, dest / "keyframes")
-    messages.append(f"Copied keyframes/ -> {dest}/keyframes/")
+    messages.append(t("msg_copied_to", name="keyframes/", dest=dest / "keyframes"))
     return messages
 
 
@@ -727,7 +752,7 @@ def archive_existing_pgo_output() -> list[str]:
     for path in existing:
         dest = archive_dir / path.name
         path.rename(dest)
-        messages.append(f"Archived old {path.name} -> {archive_dir}/")
+        messages.append(t("msg_archived_old", name=path.name, dest=archive_dir))
     return messages
 
 
@@ -807,6 +832,10 @@ def format_duration(seconds: float | int | None) -> str:
     return f"{minutes:d}:{sec:02d}"
 
 
+def status_text(alive: bool) -> str:
+    return t("status_running") if alive else t("status_stopped")
+
+
 def file_size_human(p: Path) -> str:
     size = p.stat().st_size
     if size < 1024:
@@ -862,7 +891,7 @@ def render_sidebar():
     lang_options = {"en": "English", "zh": "中文"}
     current_lang = st.session_state.lang
     selected_lang = st.sidebar.radio(
-        "🌐 Language",
+        f"🌐 {t('language')}",
         options=list(lang_options.keys()),
         format_func=lambda k: lang_options[k],
         index=list(lang_options.keys()).index(current_lang),
@@ -888,14 +917,14 @@ def render_sidebar():
     st.sidebar.divider()
 
     with st.sidebar.expander(t("file_paths"), expanded=False):
-        mn = st.session_state.map_name or "(TBD)"
-        bd = st.session_state.bag_dir or "(TBD)"
+        mn = st.session_state.map_name or t("tbd")
+        bd = st.session_state.bag_dir or t("tbd")
         st.markdown(
-            f"**PGO output:** `{PGO_OUTPUT}`\n\n"
-            f"**Prior:** `{PRIOR_DIR}/{mn}`\n\n"
-            f"**Bag:** `{bd}`\n\n"
-            f"**Grid map:** `{GRIDMAPPER_OUTPUT}`\n\n"
-            f"**Nav maps:** `{MAPS_DIR}`"
+            f"**{t('path_pgo_output')}:** `{PGO_OUTPUT}`\n\n"
+            f"**{t('path_prior')}:** `{PRIOR_DIR}/{mn}`\n\n"
+            f"**{t('path_bag')}:** `{bd}`\n\n"
+            f"**{t('path_grid_map')}:** `{GRIDMAPPER_OUTPUT}`\n\n"
+            f"**{t('path_nav_maps')}:** `{MAPS_DIR}`"
         )
 
     if 0 < st.session_state.current_step < 4:
@@ -918,20 +947,11 @@ def render_sidebar():
 
 def _list_screen_sessions() -> list[str]:
     """Return names of currently active screen sessions via `screen -ls`."""
-    try:
-        result = subprocess.run(
-            "screen -ls", shell=True, capture_output=True, text=True, timeout=5,
-        )
-        names: list[str] = []
-        # Robust regex matching for "  PID.name  (Detached)" independent of tab or space format
-        pattern = re.compile(r"^\s*(\d+)\.([^\s]+)")
-        for line in result.stdout.splitlines():
-            m = pattern.match(line.strip())
-            if m:
-                names.append(m.group(2))
-        return names
-    except Exception:
-        return []
+    names: list[str] = []
+    for entry in _screen_entries():
+        if any(state in entry["state"] for state in SCREEN_LIVE_STATES):
+            names.append(entry["name"])
+    return names
 
 
 def render_session_bar():
@@ -962,15 +982,15 @@ def render_session_bar():
     with cols[1]:
         if st.button(t("stop"), key=f"bar_stop_{selected}", type="primary", width="stretch"):
             screen_stop(selected)
-            add_message(f"Stopped {selected}")
+            add_message(t("msg_stopped", name=selected))
             st.rerun()
     with cols[2]:
         if st.button(t("restart"), key=f"bar_restart_{selected}", width="stretch"):
             result = screen_restart(selected)
             if result:
-                add_message(f"Restarted {selected}")
+                add_message(t("msg_restarted", name=selected))
             else:
-                add_message(f"Cannot restart: {selected}")
+                add_message(t("msg_cannot_restart", name=selected))
             st.rerun()
     with cols[3]:
         if st.button(t("refresh"), key=f"bar_refresh_{selected}", width="stretch"):
@@ -978,7 +998,7 @@ def render_session_bar():
     with cols[4]:
         if info and info["log_file"] and Path(info["log_file"]).exists():
             st.download_button(
-                "DL Log",
+                t("download_log"),
                 data=screen_read_log_full(selected),
                 file_name=f"{selected}.log",
                 mime="text/plain",
@@ -988,7 +1008,7 @@ def render_session_bar():
 
     # Show the command this session is running
     if info:
-        st.caption(f"Command: `{info['cmd']}`")
+        st.caption(t("command", cmd=info["cmd"]))
 
     return selected
 
@@ -1013,11 +1033,11 @@ def render_messages():
             st.caption("—")
         else:
             for msg in messages:
-                if "ERROR" in msg:
+                if "ERROR" in msg or "错误" in msg:
                     st.error(msg)
-                elif "WARN" in msg:
+                elif "WARN" in msg or "警告" in msg:
                     st.warning(msg)
-                elif any(kw in msg for kw in ("OK", "Copied", "Renamed", "ready")):
+                elif any(kw in msg for kw in ("OK", "Copied", "Renamed", "ready", "已复制", "已重命名", "已就绪", "正常")):
                     st.success(msg)
                 else:
                     st.text(msg)
@@ -1028,7 +1048,7 @@ def render_step0():
     get_monitor_manager().reset()
 
     setup_path = ALGOR_WS_ROOT / "install" / "setup.bash"
-    ws_info = f"Workspace: `{ALGOR_WS_ROOT}`\nROS_DISTRO: `{ROS2_ENV.get('ROS_DISTRO', 'N/A')}`"
+    ws_info = t("workspace_info", workspace=ALGOR_WS_ROOT, distro=ROS2_ENV.get("ROS_DISTRO", "N/A"))
     if not setup_path.exists():
         st.warning(t("s0_setup_missing"))
     st.info(ws_info)
@@ -1052,7 +1072,7 @@ def render_step1():
         st.markdown(t("s1_start_livox_desc"))
         if st.button(t("s1_start_livox"), type="primary", key="btn_s1_livox", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
-            add_message("Starting Livox lidar...")
+            add_message(t("msg_start_livox"))
             screen_launch("livox", LIVOX_LAUNCH_CMD)
             st.session_state.current_sub = "wait_livox"
             st.session_state.wait_start = time.monotonic()
@@ -1061,19 +1081,19 @@ def render_step1():
     if sub == "wait_livox":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / 20, 1.0))
-        st.caption(f"Waiting for {LIVOX_TOPIC} data... ({elapsed:.0f}s / 20s)")
+        st.caption(t("s1_wait_topic", topic=LIVOX_TOPIC, elapsed=elapsed))
 
         hz = get_topic_hz(LIVOX_TOPIC)
         if hz > 0:
             st.session_state.step1_livox_hz = hz
             st.session_state.current_sub = "start_nav"
             clear_wait_state()
-            add_message(f"{LIVOX_TOPIC} active (~{hz:.1f} Hz)")
+            add_message(t("msg_topic_active", topic=LIVOX_TOPIC, hz=hz))
             st.rerun()
         elif elapsed >= 20:
             st.session_state.current_sub = "start_nav"
             clear_wait_state()
-            add_message(f"WARN: No data on {LIVOX_TOPIC} after 20s")
+            add_message(t("msg_topic_warn", topic=LIVOX_TOPIC, seconds=20))
             st.rerun()
         else:
             pass  # fragment auto-reruns every 1s
@@ -1082,14 +1102,14 @@ def render_step1():
     if sub in ("start_nav", "wait_nav", "release_control"):
         alive = _session_alive("livox")
         hz_text = f"~{st.session_state.step1_livox_hz:.1f} Hz" if st.session_state.step1_livox_hz > 0 else ""
-        st.markdown(f"**Livox:** {'running' if alive else 'stopped'} {hz_text}")
+        st.markdown(t("status_line", name="Livox", status=status_text(alive), extra=hz_text))
 
     # Start nav_bridge
     if sub == "start_nav":
         st.markdown(t("s1_start_nav_desc"))
         if st.button(t("s1_start_nav"), type="primary", key="btn_s1_nav", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
-            add_message("Starting nav_bridge for IMU...")
+            add_message(t("msg_start_nav"))
             screen_launch("nav_bridge", NAV_BRIDGE_LAUNCH_CMD)
             st.session_state.current_sub = "wait_nav"
             st.session_state.wait_start = time.monotonic()
@@ -1098,19 +1118,19 @@ def render_step1():
     if sub == "wait_nav":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / 20, 1.0))
-        st.caption(f"Waiting for {IMU_TOPIC} data... ({elapsed:.0f}s / 20s)")
+        st.caption(t("s1_wait_topic", topic=IMU_TOPIC, elapsed=elapsed))
 
         hz = get_topic_hz(IMU_TOPIC)
         if hz > 0:
             st.session_state.step1_imu_hz = hz
             st.session_state.current_sub = "release_control"
             clear_wait_state()
-            add_message(f"{IMU_TOPIC} active (~{hz:.1f} Hz)")
+            add_message(t("msg_topic_active", topic=IMU_TOPIC, hz=hz))
             st.rerun()
         elif elapsed >= 20:
             st.session_state.current_sub = "release_control"
             clear_wait_state()
-            add_message(f"WARN: No data on {IMU_TOPIC} after 20s")
+            add_message(t("msg_topic_warn", topic=IMU_TOPIC, seconds=20))
             st.rerun()
         else:
             pass  # fragment auto-reruns every 1s
@@ -1119,18 +1139,18 @@ def render_step1():
     if sub == "release_control":
         alive = _session_alive("nav_bridge")
         hz_text = f"~{st.session_state.step1_imu_hz:.1f} Hz" if st.session_state.step1_imu_hz > 0 else ""
-        st.markdown(f"**nav_bridge:** {'running' if alive else 'stopped'} {hz_text}")
+        st.markdown(t("status_line", name="nav_bridge", status=status_text(alive), extra=hz_text))
 
     # Release control
     if sub == "release_control":
         st.markdown(t("s1_release_desc"))
         if st.button(t("s1_release"), type="primary", key="btn_s1_release", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
-            add_message("Calling /nav_bridge_node/release_control...")
+            add_message(t("msg_release_call"))
             output = run_ros2_cmd(
                 "ros2 service call /nav_bridge_node/release_control std_srvs/srv/Trigger"
             )
-            add_message(f"Control released: {output or 'OK'}")
+            add_message(t("msg_release_done", output=output or t("ok")))
             st.session_state.current_step = 2
             st.session_state.current_sub = "confirm_name"
             if not st.session_state.map_name:
@@ -1151,7 +1171,7 @@ def render_step2():
     # Confirm map name
     if sub == "confirm_name":
         st.warning(t("s2_name_notice"))
-        st.markdown(f"**Current map name:** `{map_name or '(empty)'}`")
+        st.markdown(t("s2_current_name", name=map_name or t("empty")))
         if st.button(t("s2_confirm_name"), type="primary", key="btn_s2_confirm_name", disabled=st.session_state.action_in_progress):
             clean_name = map_name.strip()
             if not clean_name:
@@ -1170,7 +1190,7 @@ def render_step2():
         st.markdown(t("s2_stand_desc"))
         if st.button(t("s2_stand_btn"), type="primary", key="btn_s2_stand", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
-            add_message("Robot is standing")
+            add_message(t("msg_robot_standing"))
             st.session_state.current_sub = "start_slam"
             st.rerun()
 
@@ -1181,7 +1201,7 @@ def render_step2():
             st.session_state.action_in_progress = True
             for m in archive_existing_pgo_output():
                 add_message(m)
-            add_message("Starting SLAM with PGO + Rviz...")
+            add_message(t("msg_start_slam"))
             screen_launch("slam", SLAM_PGO_LAUNCH_CMD)
             st.session_state.current_sub = "wait_slam"
             st.session_state.wait_start = time.monotonic()
@@ -1190,17 +1210,17 @@ def render_step2():
     if sub == "wait_slam":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / 30, 1.0))
-        st.caption(f"Waiting for `laser_mapping` node... ({elapsed:.0f}s / 30s)")
+        st.caption(t("s3_wait_node", node="laser_mapping", elapsed=elapsed, seconds=30))
 
         if check_node_exists("laser_mapping"):
             st.session_state.current_sub = "start_bag"
             clear_wait_state()
-            add_message("laser_mapping node is running")
+            add_message(t("msg_node_running", node="laser_mapping"))
             st.rerun()
         elif elapsed >= 30:
             st.session_state.current_sub = "start_bag"
             clear_wait_state()
-            add_message("WARN: laser_mapping not detected after 30s")
+            add_message(t("msg_node_warn", node="laser_mapping", seconds=30))
             st.rerun()
         else:
             pass  # fragment auto-reruns every 1s
@@ -1208,23 +1228,21 @@ def render_step2():
     # SLAM status
     if sub in ("start_bag", "navigate"):
         alive = _session_alive("slam")
-        st.markdown(f"**SLAM:** {'running' if alive else 'stopped'}")
+        st.markdown(t("s2_slam_status", status=status_text(alive)))
 
     # Start bag recording
     if sub == "start_bag":
         bag_name = f"{map_name}_sensor"
         st.session_state.bag_name = bag_name
-        st.markdown(
-            f"**Start recording** `{LIVOX_TOPIC}` and `{IMU_TOPIC}` to bag `{bag_name}`."
-        )
+        st.markdown(t("s2_start_record_desc", livox=LIVOX_TOPIC, imu=IMU_TOPIC, bag=bag_name))
         if st.button(t("s2_start_rec"), type="primary", key="btn_s2_bag", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
             BAGS_DIR.mkdir(parents=True, exist_ok=True)
-            add_message(f"Recording bag '{bag_name}' in ~/bags ...")
+            add_message(t("msg_record_bag", name=bag_name))
             cmd = f"ros2 bag record -o {bag_name} {LIVOX_TOPIC} {IMU_TOPIC}"
             screen_launch("bag_rec", cmd, cwd=str(BAGS_DIR))
             st.session_state.current_sub = "navigate"
-            add_message(f"Recording to {BAGS_DIR}/{bag_name}/")
+            add_message(t("msg_record_to", path=f"{BAGS_DIR}/{bag_name}"))
             st.rerun()
 
     # Navigate
@@ -1233,23 +1251,23 @@ def render_step2():
         slam_alive = _session_alive("slam")
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(f"**SLAM:** {'running' if slam_alive else 'stopped'}")
+            st.markdown(t("s2_slam_status", status=status_text(slam_alive)))
         with c2:
-            st.markdown(f"**Bag recording:** {'running' if rec_alive else 'stopped'}")
+            st.markdown(t("s2_bag_recording_status", status=status_text(rec_alive)))
 
         st.markdown(t("s2_navigate_desc"))
 
         if st.button(t("s2_mapping_done"), type="primary", key="btn_s2_done", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
-            add_message("Mapping complete - stopping bag recording...")
+            add_message(t("msg_mapping_complete"))
             screen_stop("bag_rec")
-            add_message("Bag recording stopped")
-            add_message("Stopping SLAM (SIGINT for PGO output)...")
+            add_message(t("msg_bag_stopped"))
+            add_message(t("msg_stop_slam"))
             if _session_alive("slam"):
                 _send_ctrl_c("slam")
-                add_message("Sent SIGINT to SLAM; waiting for PGO files to finish writing")
+                add_message(t("msg_slam_sigint"))
             else:
-                add_message("WARN: SLAM session is already stopped")
+                add_message(t("msg_slam_already_stopped"))
             st.session_state.pgo_last_size = -1
             st.session_state.pgo_stable_count = 0
             st.session_state.pgo_files_stable_at = None
@@ -1261,7 +1279,7 @@ def render_step2():
     if sub == "wait_pgo":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / PGO_WAIT_TIMEOUT_SEC, 1.0))
-        st.caption(f"Waiting for PGO output... ({elapsed:.0f}s / {PGO_WAIT_TIMEOUT_SEC}s)")
+        st.caption(t("s2_wait_pgo", elapsed=elapsed, seconds=PGO_WAIT_TIMEOUT_SEC))
 
         pgo_pcd = PGO_OUTPUT / "PGO.pcd"
         pgo_kf = PGO_OUTPUT / "keyframes"
@@ -1272,13 +1290,13 @@ def render_step2():
         c1, c2, c3 = st.columns(3)
         with c1:
             if pcd_exists:
-                st.markdown(f"**PGO.pcd:** OK ({file_size_human(pgo_pcd)})")
+                st.markdown(t("s2_pgo_pcd_ok", size=file_size_human(pgo_pcd)))
             else:
-                st.markdown("**PGO.pcd:** waiting...")
+                st.markdown(t("s2_pgo_pcd_wait"))
         with c2:
-            st.markdown(f"**keyframes/**: {'OK' if kf_exists else 'waiting...'}")
+            st.markdown(t("s2_keyframes_status", status=t("ok") if kf_exists else t("waiting")))
         with c3:
-            st.markdown(f"**SLAM:** {'writing/exiting' if slam_alive else 'stopped'}")
+            st.markdown(t("s2_slam_write_status", status=t("s2_writing_exiting") if slam_alive else t("status_stopped")))
 
         if pcd_exists and kf_exists:
             cur_size = pgo_pcd.stat().st_size + path_size_bytes(pgo_kf)
@@ -1291,7 +1309,7 @@ def render_step2():
             files_stable = st.session_state.pgo_stable_count >= PGO_STABLE_POLLS
             if files_stable and st.session_state.pgo_files_stable_at is None:
                 st.session_state.pgo_files_stable_at = time.monotonic()
-                add_message("PGO files are stable; waiting for SLAM session to exit cleanly")
+                add_message(t("msg_pgo_stable_wait_exit"))
 
             stable_at = st.session_state.pgo_files_stable_at
             exit_grace_elapsed = stable_at is not None and (time.monotonic() - stable_at) >= PGO_EXIT_GRACE_SEC
@@ -1301,24 +1319,24 @@ def render_step2():
                 st.session_state.pgo_last_size = -1
                 st.session_state.pgo_stable_count = 0
                 st.session_state.pgo_files_stable_at = None
-                add_message("PGO output ready and stable")
+                add_message(t("msg_pgo_ready"))
                 st.rerun()
 
-            st.caption(f"Size stability: {st.session_state.pgo_stable_count} / {PGO_STABLE_POLLS}")
+            st.caption(t("s2_size_stability", count=st.session_state.pgo_stable_count, target=PGO_STABLE_POLLS))
             if files_stable and slam_alive:
-                st.info("PGO files are stable; keeping the SLAM screen alive briefly so it can exit on its own.")
+                st.info(t("s2_pgo_stable_info"))
             pass  # fragment auto-reruns every 1s
         elif elapsed >= PGO_WAIT_TIMEOUT_SEC:
             if pcd_exists and kf_exists:
-                add_message("WARN: PGO output found but size still changing")
+                add_message(t("msg_pgo_changing"))
             else:
-                add_message(f"WARN: PGO output not ready after {PGO_WAIT_TIMEOUT_SEC}s")
+                add_message(t("msg_pgo_timeout", seconds=PGO_WAIT_TIMEOUT_SEC))
             st.session_state.current_sub = "copy_pgo"
             clear_wait_state()
             st.session_state.pgo_last_size = -1
             st.session_state.pgo_stable_count = 0
             st.session_state.pgo_files_stable_at = None
-            add_message("Leaving SLAM session untouched to avoid interrupting late PGO writes")
+            add_message(t("msg_leave_slam"))
             st.rerun()
 
     # Copy PGO
@@ -1326,29 +1344,27 @@ def render_step2():
         pgo_pcd = PGO_OUTPUT / "PGO.pcd"
         pgo_kf = PGO_OUTPUT / "keyframes"
         if pgo_pcd.exists() and pgo_kf.is_dir():
-            st.markdown(
-                f"**PGO output is ready.** Click to copy to `prior/{map_name}/`."
-            )
-            if st.button(f"Copy to prior/{map_name}/", type="primary", key="btn_s2_copy", disabled=st.session_state.action_in_progress):
+            st.markdown(t("s2_pgo_ready_copy", name=map_name))
+            if st.button(t("s2_copy_pgo", name=map_name), type="primary", key="btn_s2_copy", disabled=st.session_state.action_in_progress):
                 st.session_state.action_in_progress = True
                 msgs = copy_pgo_to_prior(map_name)
                 for m in msgs:
                     add_message(m)
                 if not any(m.startswith("ERROR:") for m in msgs) and _session_alive("slam"):
-                    add_message("PGO copied; stopping old SLAM session")
+                    add_message(t("msg_pgo_copied_stop"))
                     screen_stop("slam")
                 bag_dir = find_bag_dir(st.session_state.bag_name)
                 st.session_state.bag_dir = bag_dir
                 if bag_dir:
-                    add_message(f"Bag saved at ./{bag_dir}")
+                    add_message(t("msg_bag_saved", path=bag_dir))
                 else:
-                    add_message(f"WARN: Bag for '{st.session_state.bag_name}' not found")
+                    add_message(t("msg_bag_not_found", name=st.session_state.bag_name))
                 st.session_state.current_step = 3
                 st.session_state.current_sub = "start_relocal"
                 st.rerun()
         else:
-            st.warning("PGO output not found. Check logs on the left.")
-            if st.button("Continue to Step 3 (may fail)", key="btn_s2_no_pgo"):
+            st.warning(t("s2_pgo_missing"))
+            if st.button(t("s2_continue_step3"), key="btn_s2_no_pgo"):
                 st.session_state.current_step = 3
                 st.session_state.current_sub = "start_relocal"
                 st.rerun()
@@ -1360,22 +1376,22 @@ def render_step3():
     map_name = st.session_state.map_name
     bag_dir = st.session_state.bag_dir
 
-    st.caption(f"Map: `{map_name}` | Bag: `{bag_dir or '(not found)'}`")
+    st.caption(t("s3_map_bag_caption", map=map_name, bag=bag_dir or t("not_found")))
 
     # Start relocalization
     if sub == "start_relocal":
-        st.markdown("**Stop live sensor nodes and start relocalization** with the prior map.")
+        st.markdown(t("s3_start_relocal_desc"))
         relocal_cmd = RELOCAL_LAUNCH_CMD.format(prior=map_name)
         st.code(relocal_cmd)
-        if st.button("Start Relocalization", type="primary", key="btn_s3_relocal", disabled=st.session_state.action_in_progress):
+        if st.button(t("s3_start_relocal"), type="primary", key="btn_s3_relocal", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
             if _session_alive("livox"):
                 screen_stop("livox")
-                add_message("Stopped livox")
+                add_message(t("msg_stopped", name="livox"))
             if _session_alive("nav_bridge"):
                 screen_stop("nav_bridge")
-                add_message("Stopped nav_bridge")
-            add_message(f"Starting relocalization with prior='{map_name}'...")
+                add_message(t("msg_stopped", name="nav_bridge"))
+            add_message(t("msg_start_relocal", name=map_name))
             screen_launch("relocal", relocal_cmd)
             st.session_state.current_sub = "wait_relocal"
             st.session_state.wait_start = time.monotonic()
@@ -1384,17 +1400,17 @@ def render_step3():
     if sub == "wait_relocal":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / 30, 1.0))
-        st.caption(f"Waiting for `laser_mapping` node... ({elapsed:.0f}s / 30s)")
+        st.caption(t("s3_wait_node", node="laser_mapping", elapsed=elapsed, seconds=30))
 
         if check_node_exists("laser_mapping"):
             st.session_state.current_sub = "start_grid"
             clear_wait_state()
-            add_message("laser_mapping node is running (relocal mode)")
+            add_message(t("msg_node_running_mode", node="laser_mapping", mode=t("mode_relocal")))
             st.rerun()
         elif elapsed >= 30:
             st.session_state.current_sub = "start_grid"
             clear_wait_state()
-            add_message("WARN: laser_mapping not detected after 30s")
+            add_message(t("msg_node_warn", node="laser_mapping", seconds=30))
             st.rerun()
         else:
             pass  # fragment auto-reruns every 1s
@@ -1402,23 +1418,23 @@ def render_step3():
     # Relocal status
     if sub in ("start_grid", "wait_rviz", "start_playback", "wait_playback"):
         alive = _session_alive("relocal")
-        st.markdown(f"**Relocalization:** {'running' if alive else 'stopped'}")
+        st.markdown(t("s3_relocal_status", status=status_text(alive)))
 
     # Start grid mapper
     if sub == "start_grid":
-        st.markdown("**Start the grid mapper + Rviz.**")
-        if st.button("Start Grid Mapper", type="primary", key="btn_s3_grid", disabled=st.session_state.action_in_progress):
+        st.markdown(t("s3_start_grid_desc"))
+        if st.button(t("s3_start_grid"), type="primary", key="btn_s3_grid", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
-            add_message("Starting global grid mapper + Rviz...")
+            add_message(t("msg_start_grid"))
             screen_launch("gridmapper", GRIDMAPPER_LAUNCH_CMD)
             st.session_state.current_sub = "wait_rviz"
             st.rerun()
 
     if sub == "wait_rviz":
         alive = _session_alive("gridmapper")
-        st.markdown(f"**Grid Mapper:** {'running' if alive else 'stopped'}")
-        st.markdown("**Wait for Rviz to load**, then click below.")
-        if st.button("Rviz Ready", type="primary", key="btn_s3_rviz", disabled=st.session_state.action_in_progress):
+        st.markdown(t("s3_grid_status", status=status_text(alive)))
+        st.markdown(t("s3_wait_rviz"))
+        if st.button(t("s3_rviz_ready"), type="primary", key="btn_s3_rviz", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
             st.session_state.current_sub = "start_playback"
             st.rerun()
@@ -1426,16 +1442,16 @@ def render_step3():
     # Grid status
     if sub in ("start_playback", "wait_playback", "observe"):
         alive = _session_alive("gridmapper")
-        st.markdown(f"**Grid Mapper:** {'running' if alive else 'stopped'}")
+        st.markdown(t("s3_grid_status", status=status_text(alive)))
 
     # Start playback
     if sub == "start_playback":
         if bag_dir:
-            st.markdown(f"**Play the recorded bag** with `--clock`.")
+            st.markdown(t("s3_play_desc"))
             st.code(f"ros2 bag play {bag_dir} --clock")
-            if st.button("Start Playback", type="primary", key="btn_s3_play", disabled=st.session_state.action_in_progress):
+            if st.button(t("s3_start_play"), type="primary", key="btn_s3_play", disabled=st.session_state.action_in_progress):
                 st.session_state.action_in_progress = True
-                add_message(f"Playing bag '{bag_dir}' with --clock...")
+                add_message(t("msg_play_bag", path=bag_dir))
                 cmd = f"ros2 bag play {bag_dir} --clock"
                 duration_sec = get_bag_duration_sec(bag_dir)
                 screen_launch("bag_play", cmd)
@@ -1444,9 +1460,9 @@ def render_step3():
                 st.session_state.current_sub = "wait_playback"
                 st.rerun()
         else:
-            st.warning("Bag directory not found.")
-            st.markdown("**Manually run:** `ros2 bag play <your_bag>/ --clock`")
-            if st.button("I've Started Playback Manually", type="primary", key="btn_s3_manual_play"):
+            st.warning(t("s3_bag_missing"))
+            st.markdown(t("s3_manual_play"))
+            if st.button(t("s3_manual_play_done"), type="primary", key="btn_s3_manual_play"):
                 st.session_state.current_sub = "observe"
                 st.rerun()
 
@@ -1454,7 +1470,7 @@ def render_step3():
     if sub == "wait_playback":
         play_alive = _session_alive("bag_play")
         if play_alive:
-            st.markdown("**Bag playback in progress...**")
+            st.markdown(t("s3_playing"))
             started_at = st.session_state.get("playback_started_at")
             duration_sec = st.session_state.get("playback_duration_sec")
             if started_at and duration_sec:
@@ -1463,22 +1479,22 @@ def render_step3():
                 progress = min(elapsed / duration_sec, 1.0)
                 st.progress(progress)
                 st.caption(
-                    f"Elapsed: {format_duration(elapsed)} / {format_duration(duration_sec)} "
-                    f"· Remaining: ~{format_duration(remaining)}"
+                    t("s3_play_progress", elapsed=format_duration(elapsed),
+                      total=format_duration(duration_sec), remaining=format_duration(remaining))
                 )
             else:
                 st.progress(0.0)
-                st.caption("Bag duration unavailable; showing live log only.")
+                st.caption(t("s3_play_unknown"))
             log_tail = screen_read_log("bag_play", max_lines=5)
             st.code(log_tail, language="text")
-            if st.button("Skip Playback Wait", key="btn_s3_skip_play"):
+            if st.button(t("s3_skip_play"), key="btn_s3_skip_play"):
                 st.session_state.playback_started_at = None
                 st.session_state.playback_duration_sec = None
                 st.session_state.current_sub = "observe"
                 st.rerun()
             pass  # fragment auto-reruns every 1s
         else:
-            add_message("Bag playback finished")
+            add_message(t("msg_play_finished"))
             st.session_state.playback_started_at = None
             st.session_state.playback_duration_sec = None
             st.session_state.current_sub = "observe"
@@ -1486,28 +1502,25 @@ def render_step3():
 
     # Observe
     if sub == "observe":
-        st.markdown(
-            "**Check the grid map in Rviz.** "
-            "When satisfied, click below to stop all nodes."
-        )
-        if st.button("Stop All Nodes", type="primary", key="btn_s3_stop", disabled=st.session_state.action_in_progress):
+        st.markdown(t("s3_observe_desc_full"))
+        if st.button(t("s3_stop_all"), type="primary", key="btn_s3_stop", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
             st.session_state.current_sub = "stop_nodes"
             st.rerun()
 
     # Stop nodes
     if sub == "stop_nodes":
-        st.markdown("**Stopping nodes...**")
+        st.markdown(t("s3_stopping"))
 
         # Stop bag_play and relocal immediately (no file output needed)
         for name in ("bag_play", "relocal"):
             if _session_alive(name):
                 screen_stop(name)
-                add_message(f"Stopped {name}")
+                add_message(t("msg_stopped", name=name))
 
         # Gracefully stop gridmapper — send SIGINT and wait for it to save
         if _session_alive("gridmapper"):
-            add_message("Sending SIGINT to gridmapper (saving map files)...")
+            add_message(t("msg_send_grid_sigint"))
             _send_ctrl_c("gridmapper")
         st.session_state.current_sub = "wait_grid_output"
         st.session_state.wait_start = time.monotonic()
@@ -1517,7 +1530,7 @@ def render_step3():
     if sub == "wait_grid_output":
         elapsed = time.monotonic() - get_wait_start()
         st.progress(min(elapsed / 30, 1.0))
-        st.caption(f"Waiting for gridmapper to save map files... ({elapsed:.0f}s / 30s)")
+        st.caption(t("s3_wait_grid_caption", elapsed=elapsed, seconds=30))
 
         grid_alive = _session_alive("gridmapper")
         map_png = GRIDMAPPER_OUTPUT / "map.png"
@@ -1529,21 +1542,21 @@ def render_step3():
             if grid_alive:
                 screen_stop("gridmapper")
             clear_wait_state()
-            add_message("Gridmapper output files ready")
+            add_message(t("msg_grid_ready"))
             st.session_state.current_sub = "check_output"
             st.rerun()
         elif not grid_alive:
             # Gridmapper exited on its own — check if files appeared
             clear_wait_state()
             if files_ready:
-                add_message("Gridmapper output files ready")
+                add_message(t("msg_grid_ready"))
             else:
-                add_message("WARN: Gridmapper exited but map files not found")
+                add_message(t("msg_grid_missing"))
             st.session_state.current_sub = "check_output"
             st.rerun()
         elif elapsed >= 30:
             # Timeout — force stop and proceed
-            add_message("WARN: Gridmapper save timeout (30s), force stopping")
+            add_message(t("msg_grid_timeout", seconds=30))
             screen_stop("gridmapper")
             clear_wait_state()
             st.session_state.current_sub = "check_output"
@@ -1553,26 +1566,26 @@ def render_step3():
 
     # Check output
     if sub == "check_output":
-        st.markdown("**Check the generated map files:**")
+        st.markdown(t("s3_check_files"))
         map_png = GRIDMAPPER_OUTPUT / "map.png"
         map_yaml = GRIDMAPPER_OUTPUT / "map.yaml"
         map_conn = GRIDMAPPER_OUTPUT / "map_connections.txt"
         for f in (map_png, map_yaml, map_conn):
             if f.exists():
-                st.markdown(f"OK - `{f.name}` ({file_size_human(f)})")
+                st.markdown(t("s3_file_ok", name=f.name, size=file_size_human(f)))
             else:
-                st.markdown(f"MISSING - `{f.name}`")
+                st.markdown(t("s3_file_missing", name=f.name))
         if map_png.exists():
-            st.image(str(map_png), caption="map.png (generated)", width="stretch")
-            if st.button("Proceed to Rename", type="primary", key="btn_s3_rename_go", disabled=st.session_state.action_in_progress):
+            st.image(str(map_png), caption=t("s3_generated_image_caption"), width="stretch")
+            if st.button(t("s3_proceed_rename"), type="primary", key="btn_s3_rename_go", disabled=st.session_state.action_in_progress):
                 st.session_state.action_in_progress = True
                 st.session_state.current_sub = "rename"
                 st.rerun()
 
     # Rename
     if sub == "rename":
-        st.markdown(f"**Rename** `map.*` -> `{map_name}.*` and update yaml.")
-        if st.button(f"Rename to '{map_name}'", type="primary", key="btn_s3_rename", disabled=st.session_state.action_in_progress):
+        st.markdown(t("s3_rename_desc", name=map_name))
+        if st.button(t("s3_rename_btn", name=map_name), type="primary", key="btn_s3_rename", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
             msgs = rename_grid_map("map", map_name)
             for m in msgs:
@@ -1583,21 +1596,18 @@ def render_step3():
     # Review
     if sub == "review":
         renamed_png = GRIDMAPPER_OUTPUT / f"{map_name}.png"
-        st.markdown(
-            f"**Review the map** — open `{map_name}.png` in GIMP if needed.\n\n"
-            "**Do NOT change the resolution.**"
-        )
+        st.markdown(t("s3_review_desc_live", name=map_name))
         if renamed_png.exists():
             st.image(str(renamed_png), caption=f"{map_name}.png", width="stretch")
-        if st.button("Map Looks Good", type="primary", key="btn_s3_review", disabled=st.session_state.action_in_progress):
+        if st.button(t("s3_map_good"), type="primary", key="btn_s3_review", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
             st.session_state.current_sub = "copy_maps"
             st.rerun()
 
     # Copy to maps
     if sub == "copy_maps":
-        st.markdown(f"**Copy** map files to `{MAPS_DIR}/` for navigation.")
-        if st.button(f"Copy to {MAPS_DIR.name}/", type="primary", key="btn_s3_copy", disabled=st.session_state.action_in_progress):
+        st.markdown(t("s3_copy_desc", path=MAPS_DIR))
+        if st.button(t("s3_copy_button", name=MAPS_DIR.name), type="primary", key="btn_s3_copy", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
             msgs = copy_grid_map(map_name)
             for m in msgs:
@@ -1608,22 +1618,19 @@ def render_step3():
     # Rebuild
     if sub == "rebuild":
         build_cmd = "colcon build --packages-select multi_map_nav --cmake-args -Wno-dev -DCMAKE_EXPORT_COMPILE_COMMANDS=1 --symlink-install"
-        st.markdown(
-            f"**Rebuild** the navigation module.\n\n"
-            f"`{build_cmd}`"
-        )
+        st.markdown(t("s3_rebuild_command", cmd=build_cmd))
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Rebuild Now", type="primary", key="btn_s3_rebuild", disabled=st.session_state.action_in_progress):
+            if st.button(t("s3_rebuild_now"), type="primary", key="btn_s3_rebuild", disabled=st.session_state.action_in_progress):
                 st.session_state.action_in_progress = True
-                add_message("Running colcon build...")
+                add_message(t("msg_build_start"))
                 cmd = f"{build_cmd} 2>&1"
                 screen_launch("build", cmd, cwd=str(ALGOR_WS_ROOT))
                 st.session_state.current_sub = "wait_build"
                 st.rerun()
         with c2:
-            if st.button("Skip Rebuild", key="btn_s3_skip_rebuild"):
-                add_message("Skipped rebuild")
+            if st.button(t("s3_skip_rebuild"), key="btn_s3_skip_rebuild"):
+                add_message(t("msg_build_skipped"))
                 st.session_state.current_step = 4
                 st.session_state.current_sub = "cleanup"
                 st.rerun()
@@ -1632,12 +1639,12 @@ def render_step3():
     if sub == "wait_build":
         build_alive = _session_alive("build")
         if build_alive:
-            st.markdown("**Build in progress...**")
+            st.markdown(t("s3_building"))
             log_tail = screen_read_log("build", max_lines=20)
             st.code(log_tail, language="text")
             pass  # fragment auto-reruns every 1s
         else:
-            add_message("Build complete")
+            add_message(t("msg_build_complete"))
             st.session_state.current_step = 4
             st.session_state.current_sub = "cleanup"
             st.rerun()
@@ -1653,12 +1660,12 @@ def render_step4():
 
         if running:
             names = ", ".join(n for n, _ in running)
-            st.markdown(f"**Remaining running sessions:** {names}")
-            if st.button("Stop All Remaining Sessions", type="primary", key="btn_s4_stop", disabled=st.session_state.action_in_progress):
+            st.markdown(t("s4_remaining", names=names))
+            if st.button(t("s4_stop_remaining"), type="primary", key="btn_s4_stop", disabled=st.session_state.action_in_progress):
                 st.session_state.action_in_progress = True
                 for n, _ in running:
                     screen_stop(n)
-                    add_message(f"Stopped {n}")
+                    add_message(t("msg_stopped", name=n))
                 clean_orphans()
                 st.session_state.current_sub = "done"
                 st.rerun()
