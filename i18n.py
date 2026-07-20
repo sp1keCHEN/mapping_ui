@@ -147,6 +147,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                              "zh": "停止所有残留会话"},
     "s4_all_done":          {"en": "**All mapping steps are done.**",
                              "zh": "**所有建图步骤已完成。**"},
+    "s4_project_location":  {"en": "Mapping project deployed to: `{path}`", "zh": "建图项目已部署至：`{path}`"},
+    "s4_project_contents":  {"en": "This directory contains the PGO relocalization prior and the complete multi-floor navigation map set.",
+                              "zh": "该目录包含 PGO 重定位先验以及完整的多楼层导航地图。"},
     "s4_reset":             {"en": "Reset Workflow",            "zh": "重置流程"},
 
     # ── Left panel ───────────────────────────────────────────────────
@@ -344,6 +347,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                     "zh": "完成第二圈行走，在楼梯、门、电梯或走廊处切图。本圈不录制 ROS bag。"},
     "two_loop_finish_second": {"en": "Finish Loop 2 and Deploy Maps", "zh": "完成第二圈并部署地图"},
     "two_loop_recheck": {"en": "Recheck Multi-Map Output", "zh": "重新检查多地图输出"},
+    "two_loop_maps_valid": {"en": "Multi-floor map output is valid: {maps} ({relations} relations, {transitions} transition points).",
+                              "zh": "多楼层地图输出校验通过：{maps}（{relations} 条地图关系，{transitions} 个传送点）。"},
+    "two_loop_preview_floor": {"en": "Floor map to inspect", "zh": "选择要检查的楼层地图"},
+    "two_loop_preview_caption": {"en": "{map_id} occupancy map", "zh": "{map_id} 栅格地图"},
+    "two_loop_review_maps_desc": {"en": "Inspect every floor map before deployment. After confirmation, the PGO prior and complete multi-floor map set will be published atomically to `{destination}`.",
+                                   "zh": "请逐一检查各楼层栅格地图。确认后，PGO 定位先验和完整多楼层地图将原子发布到 `{destination}`。"},
+    "two_loop_confirm_deploy": {"en": "Confirm Maps and Deploy Project", "zh": "确认地图并部署项目"},
     "two_loop_input_status": {"en": "GridMapper input: cloud {cloud_hz:.1f} Hz · odometry {odom_hz:.1f} Hz",
                                "zh": "GridMapper 输入：点云 {cloud_hz:.1f} Hz · 里程计 {odom_hz:.1f} Hz"},
     "two_loop_input_ready": {"en": "Synchronized point-cloud and odometry input is active.",

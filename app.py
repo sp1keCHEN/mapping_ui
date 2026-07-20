@@ -1209,6 +1209,9 @@ def render_step4():
 
     if sub == "done":
         st.markdown(t("s4_all_done"))
+        destination = MAPS_ROOT / st.session_state.map_name
+        st.success(t("s4_project_location", path=destination))
+        st.caption(t("s4_project_contents"))
 
         if st.button(t("s4_reset"), type="primary", key="btn_s4_reset", disabled=st.session_state.action_in_progress):
             st.session_state.action_in_progress = True
@@ -1430,6 +1433,20 @@ def render_second_loop_mapping():
             if not report.valid:
                 st.session_state.current_sub = "second_validation_error"
                 st.rerun()
+            st.session_state.current_sub = "second_review"
+            clear_wait_state()
+            add_message(t("msg_grid_ready"))
+            st.rerun()
+    elif sub == "second_review":
+        report = inspect_multimap_dir(MULTI_MAP_OUTPUT)
+        if not report.valid:
+            st.session_state.current_sub = "second_validation_error"
+            st.rerun()
+        st.success(t("two_loop_maps_valid", maps=", ".join(report.map_ids), relations=report.relations_count, transitions=report.transitions_count))
+        selected_map = st.selectbox(t("two_loop_preview_floor"), report.map_ids, key="second_preview_map")
+        st.image(str(MULTI_MAP_OUTPUT / f"{selected_map}.png"), caption=t("two_loop_preview_caption", map_id=selected_map), width="stretch")
+        st.info(t("two_loop_review_maps_desc", destination=MAPS_ROOT / project))
+        if st.button(t("two_loop_confirm_deploy"), type="primary", key="two_confirm_deploy"):
             try:
                 target = deploy_project(prior, MULTI_MAP_OUTPUT, MAPS_ROOT, project)
                 add_message(t("msg_project_deployed", path=target))
