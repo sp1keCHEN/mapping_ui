@@ -34,9 +34,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
     # ── Step names ───────────────────────────────────────────────────
     "step0_name":           {"en": "Init",                      "zh": "初始化"},
-    "step1_name":           {"en": "Sensor Setup",              "zh": "传感器启动"},
-    "step2_name":           {"en": "PGO SLAM",                  "zh": "三维建图"},
-    "step3_name":           {"en": "Grid Map",                  "zh": "栅格地图"},
+    "step1_name":           {"en": "Loop 1 Sensors",            "zh": "第一圈传感器"},
+    "step2_name":           {"en": "Loop 1 PGO",                "zh": "第一圈 PGO"},
+    "step3_name":           {"en": "Loop 2 Multi-Map",          "zh": "第二圈多地图"},
     "step4_name":           {"en": "Complete",                  "zh": "完成"},
 
     # ── Step 0 ───────────────────────────────────────────────────────
@@ -47,14 +47,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
 1. **Sensor Setup** — Start Livox Lidar and nav_bridge IMU
 2. **PGO SLAM** — 3D pointcloud map construction
-3. **Grid Map** — Offline grid map from bag playback
-4. **Complete** — Cleanup and finish""",
+3. **Loop 1 PGO** — Build and review the loop-closed PCD while recording a debug bag
+4. **Loop 2 Multi-Map** — Relocalize against that PCD and create floor maps online""",
                              "zh": """本工具引导你完成完整的建图流程：
 
 1. **传感器启动** — 启动 Livox 激光雷达和 nav_bridge IMU
 2. **三维建图** — 基于 PGO 的三维点云地图构建
-3. **栅格地图** — 离线回放生成占据栅格地图
-4. **完成** — 清理并结束"""},
+3. **第一圈 PGO** — 生成并审核回环优化 PCD，同时录制排错 bag
+4. **第二圈多地图** — 基于该 PCD 重定位并在线创建楼层地图"""},
     "start_workflow":       {"en": "Start Workflow",            "zh": "开始建图"},
 
     # ── Step 1 ───────────────────────────────────────────────────────
@@ -108,10 +108,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "s2_pgo_ready":         {"en": "PGO output ready and stable",
                              "zh": "PGO 输出已就绪且大小稳定"},
     "s2_copy_pgo":          {"en": "Copy to prior/{name}/",     "zh": "复制到 prior/{name}/"},
+    "s2_start_grid_online": {"en": "Start Online Grid Mapper", "zh": "启动在线栅格建图"},
+    "s2_start_grid_online_desc": {"en": "**Start GridMapper now.** It stays active while the robot drives and switches floors.",
+                                   "zh": "**现在启动 GridMapper。** 机器人行走和切换楼层时它会持续建图。"},
+    "s2_grid_status":       {"en": "**Online GridMapper:** {status}", "zh": "**在线 GridMapper：** {status}"},
 
     # ── Step 3 ───────────────────────────────────────────────────────
-    "s3_header":            {"en": "Step 3: Grid Map Construction (Offline)",
-                             "zh": "步骤 3：栅格地图构建（离线）"},
+    "s3_header":            {"en": "Step 3: Verify and Deploy Online Maps",
+                             "zh": "步骤 3：校验并部署在线地图"},
+    "s3_online_caption":    {"en": "Project: `{project}` | Waiting for online output: `{output}`",
+                             "zh": "项目：`{project}` | 等待在线输出：`{output}`"},
     "s3_start_relocal":     {"en": "Start Relocalization",      "zh": "启动重定位"},
     "s3_start_grid":        {"en": "Start Grid Mapper",         "zh": "启动栅格建图"},
     "s3_rviz_ready":        {"en": "Rviz Ready",                "zh": "Rviz 已就绪"},
@@ -276,6 +282,80 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "s3_rebuild_command":   {"en": "**Rebuild** the navigation module.\n\n`{cmd}`",
                              "zh": "**重新编译**导航模块。\n\n`{cmd}`"},
     "s3_building":          {"en": "**Build in progress...**",   "zh": "**正在编译...**"},
+    "s3_multimap_header":   {"en": "Multi-floor map switching", "zh": "多楼层地图切换"},
+    "s3_multimap_caption":  {"en": "Live GridMapper output: `{output}`", "zh": "GridMapper 实时输出：`{output}`"},
+    "s3_multimap_summary":  {"en": "Maps: {maps} · relations: {relations} · transitions: {transitions}",
+                              "zh": "地图：{maps} · 关系：{relations} · 传送点：{transitions}"},
+    "s3_relations":         {"en": "Map relations", "zh": "地图关系"},
+    "s3_transitions":       {"en": "Transition points", "zh": "传送点"},
+    "switch_history":       {"en": "Map switch service history", "zh": "地图切换服务历史"},
+    "last_switch_response": {"en": "Latest complete service response", "zh": "最近一次完整服务响应"},
+    "switch_same_map":      {"en": "Target map '{map}' is already active.", "zh": "目标地图“{map}”已是当前活动地图。"},
+    "s3_target_map":        {"en": "Target map ID", "zh": "目标地图 ID"},
+    "s3_transition_type":   {"en": "Transition type", "zh": "通道类型"},
+    "s3_bidirectional":     {"en": "Bidirectional", "zh": "双向通行"},
+    "s3_switch_map":        {"en": "Create / Switch Map", "zh": "新建 / 切换地图"},
+    "s3_active_map":        {"en": "Active map: `{map}`", "zh": "当前活动地图：`{map}`"},
+    "s3_archive_notice":    {"en": "Starting a new project archives the previous `{output}` output.",
+                              "zh": "开始新项目会归档此前的 `{output}` 输出。"},
+    "s3_multimap_valid":    {"en": "Valid multi-map output: {maps} ({relations} relations, {transitions} transitions).",
+                              "zh": "多地图输出有效：{maps}（{relations} 条关系，{transitions} 个传送点）。"},
+    "s3_preview_map":       {"en": "Preview floor map", "zh": "预览楼层地图"},
+    "s3_deploy_project":    {"en": "Deploy Mapping Project", "zh": "部署建图项目"},
+    "s3_deploy_desc":       {"en": "Publish the prior and complete multi-map output atomically to `{destination}`. Navigation reads this directory directly; no rebuild is needed.",
+                              "zh": "将 prior 与完整多地图输出原子发布到 `{destination}`。导航直接读取此目录，无需重新编译。"},
+    "s3_deploy_confirm":    {"en": "Confirm Deployment", "zh": "确认部署"},
+    "msg_multimap_archived": {"en": "Archived previous multi-map output to {path}", "zh": "已归档此前多地图输出到 {path}"},
+    "msg_switch_ok":        {"en": "Switched active map to {target}", "zh": "已切换活动地图至 {target}"},
+    "msg_switch_failed":    {"en": "ERROR: map switch failed: {output}", "zh": "错误：地图切换失败：{output}"},
+    "msg_switch_not_ready": {"en": "WARN: GridMapper has not received synchronized odometry yet; wait for the second-loop input status to become ready.",
+                              "zh": "警告：GridMapper 尚未收到同步里程计；请等待第二圈输入状态就绪后再切图。"},
+    "msg_project_deployed": {"en": "Mapping project deployed to {path}", "zh": "建图项目已部署到 {path}"},
+
+    # ── Two-loop online mapping ───────────────────────────────────────
+    "two_loop_first_sensors": {"en": "Pass 1: Global Point-Cloud Acquisition", "zh": "第一圈：全局点云采集"},
+    "two_loop_first_sensors_desc": {"en": "Start the lidar and IMU for the PGO loop. GridMapper is deliberately not started in this loop.",
+                                     "zh": "启动用于第一圈 PGO 建图的雷达和 IMU。本阶段不启动 GridMapper。"},
+    "two_loop_first_pgo": {"en": "Pass 1: PGO Global Point Cloud", "zh": "第一圈：PGO 全局点云建图"},
+    "two_loop_project_notice": {"en": "This project name is shared by the first-loop PCD, debug bag, second-loop maps, and final deployment.",
+                                  "zh": "项目名会贯穿第一圈 PCD、排错 bag、第二圈地图和最终部署目录。"},
+    "two_loop_first_slam_desc": {"en": "Start Faster-LIO with PGO. Complete one full loop so loop closure can optimize the PCD.",
+                                  "zh": "启动带 PGO 的 Faster-LIO。请完整走一圈，使回环优化生成稳定 PCD。"},
+    "two_loop_start_first_slam": {"en": "Start Loop 1 PGO SLAM", "zh": "启动第一圈 PGO SLAM"},
+    "two_loop_first_bag_desc": {"en": "Record raw lidar and IMU data to `{bag}` for debugging. This bag is not used to build maps.",
+                                 "zh": "将原始雷达和 IMU 数据录制到 `{bag}` 用于排错；该 bag 不参与建图。"},
+    "two_loop_first_drive_desc": {"en": "Drive the first complete loop. Do not switch maps in this loop.",
+                                   "zh": "完成第一圈行走。本圈不要切换地图。"},
+    "two_loop_finish_first": {"en": "Finish Loop 1 and Generate PCD", "zh": "完成第一圈并生成 PCD"},
+    "two_loop_pcd_review": {"en": "PCD Quality Review", "zh": "PCD 质量审核"},
+    "two_loop_pcd_points": {"en": "Preview points", "zh": "预览点数"},
+    "two_loop_pcd_topdown": {"en": "Top-down sampled PCD preview", "zh": "PCD 抽样俯视预览"},
+    "two_loop_pcd_external": {"en": "Browser preview unavailable ({error}). Verify `{path}` in RViz or an external point-cloud tool.",
+                               "zh": "网页无法预览（{error}）。请使用 RViz 或外部点云工具确认 `{path}`。"},
+    "two_loop_pcd_confirm_desc": {"en": "Confirm the PCD only after checking loop closure and coverage. Confirmation saves the prior and closes remaining Loop 1 sensor nodes.",
+                                   "zh": "确认回环和覆盖范围无误后再继续。确认会保存 prior 并关闭第一圈剩余传感器节点。"},
+    "two_loop_confirm_pcd": {"en": "PCD Is Correct — Save and Start Loop 2", "zh": "PCD 无误 — 保存并进入第二圈"},
+    "two_loop_second_header": {"en": "Pass 2: Relocalized Multi-Floor Grid Mapping", "zh": "第二圈：重定位多楼层栅格建图"},
+    "two_loop_second_desc": {"en": "Restart sensors for the second loop. Faster-LIO will relocalize against the confirmed PCD; PGO remains off.",
+                              "zh": "为第二圈重新启动传感器。Faster-LIO 将基于已确认 PCD 重定位，不运行 PGO。"},
+    "two_loop_start_relocal": {"en": "Start Relocalized Faster-LIO", "zh": "启动重定位 Faster-LIO"},
+    "two_loop_release_second_desc": {"en": "Release platform control before starting relocalized mapping.",
+                                      "zh": "启动重定位建图前，请先释放底盘控制权。"},
+    "two_loop_release_second": {"en": "Release Platform Control", "zh": "释放底盘控制权"},
+    "two_loop_start_grid": {"en": "Start GridMapper", "zh": "启动 GridMapper"},
+    "two_loop_second_drive_desc": {"en": "Drive the second loop and switch maps at stairs, doors, elevators, or corridors. No ROS bag is recorded in this loop.",
+                                    "zh": "完成第二圈行走，在楼梯、门、电梯或走廊处切图。本圈不录制 ROS bag。"},
+    "two_loop_finish_second": {"en": "Finish Loop 2 and Deploy Maps", "zh": "完成第二圈并部署地图"},
+    "two_loop_recheck": {"en": "Recheck Multi-Map Output", "zh": "重新检查多地图输出"},
+    "two_loop_input_status": {"en": "**GridMapper input:** cloud {cloud_hz:.1f} Hz · odometry {odom_hz:.1f} Hz",
+                               "zh": "**GridMapper 输入：**点云 {cloud_hz:.1f} Hz · 里程计 {odom_hz:.1f} Hz"},
+    "two_loop_input_ready": {"en": "Synchronized point-cloud and odometry input is active.",
+                              "zh": "同步点云与里程计输入已激活。"},
+    "two_loop_enter_mapping": {"en": "Enter Multi-Floor Mapping", "zh": "进入多楼层建图"},
+    "two_loop_input_wait": {"en": "Waiting for relocalized point cloud and odometry. Map switching is intentionally unavailable.",
+                             "zh": "正在等待重定位点云和里程计；在此之前已禁止切图。"},
+    "two_loop_input_diagnose": {"en": "If the rates remain 0, inspect the relocalization log. A failed initial registration usually means the first-loop PCD has insufficient coverage or does not match the current start area.",
+                                 "zh": "若频率持续为 0，请检查重定位日志。初始配准失败通常意味着第一圈 PCD 覆盖不足，或与第二圈起点环境不匹配。"},
 
     # ── Step 4 details ──────────────────────────────────────────────────
     "s4_remaining":         {"en": "**Remaining running sessions:** {names}", "zh": "**仍在运行的会话：** {names}"},

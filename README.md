@@ -1,6 +1,6 @@
 # ROS2 自动化建图工具用户手册 (Mapping UI)
 
-这是一个交互式的 ROS2 建图辅助 Web 工具，旨在引导操作人员完成从雷达/IMU启动、三维点云建图（faster-lio PGO）、数据包录制，到离线栅格地图生成（gridmapper）以及最终导航地图部署的完整流程。
+这是一个交互式的 ROS2 建图辅助 Web 工具，旨在引导操作人员完成从雷达/IMU 启动、三维点云建图（faster-lio PGO）、原始数据包录制，到**在线**多楼层栅格地图生成（GridMapper）以及最终导航项目部署的完整流程。
 
 ---
 
@@ -19,7 +19,21 @@ uv run streamlit run app.py --server.port 8501
 MAPPING_UI_WS_SRC=/path/to/algor_ws/src uv run streamlit run app.py --server.port 8501
 ```
 
+地图项目默认部署到 workspace 同级的 `~/Workspace/Maps/<项目名>/`。可通过 `MAPPING_UI_MAPS_ROOT` 改为其他目录，例如：
+```bash
+MAPPING_UI_MAPS_ROOT=/home/cat/Maps uv run streamlit run app.py --server.port 8501
+```
+
 应用启动时会优先从当前项目所在 workspace、`AMENT_PREFIX_PATH` / `COLCON_PREFIX_PATH` 的 ament index 中快速解析 `faster_lio`、`gridmapper`、`multi_map_nav` 等包路径；只有快速路径失败时才会有限扫描 `package.xml`。
+
+## 双圈建图流程
+
+页面将建图明确分成两圈，避免 PGO 回环优化影响在线栅格地图的坐标：
+
+1. **第一圈（PGO + 排错 bag）**：启动 Livox、nav_bridge 和 `faster_lio ... pgo:=true`，录制原始雷达/IMU bag，完成一整圈后结束 PGO。
+2. **PCD 审核**：页面显示 PGO 点云的抽样俯视图、点数和坐标范围。确认无误后保存 prior，并关闭第一圈所有节点。
+3. **第二圈（重定位 + 多地图）**：重新启动传感器，以 `relocal:=true prior_dir:=<第一圈 prior>` 启动 Faster-LIO，再启动 GridMapper；行走时通过页面切换楼层地图。本圈不录制 bag，也不运行 PGO。
+4. **自动部署**：第二圈结束后，完整多地图输出与第一圈 PGO 会发布到 `~/Workspace/Maps/<项目名>/`。
 
 ### 2. 访问界面
 在浏览器中打开：`http://localhost:8501`。
@@ -78,21 +92,11 @@ Web 界面采用三行式仪表盘布局，操作高度解耦，确保前台交�
 7. **保存点云文件**：检测到 PGO 稳定就绪后，点击按钮将生成的文件复制到 `prior/` 对应地图名目录下。随后自动进入 Step 3。
    * 复制成功后，系统才会清理旧的 `slam` 会话，避免影响下一步重定位。
 
-### Step 3: 离线栅格地图构建 (Grid Mapper)
-1. **启动重定位**：点击 **"Start Relocalization"**，系统自动加载刚才保存的 `prior` 点云数据，并等待定位节点就绪。
-   * 实际启动命令会使用 `prior_dir:=<map_name>`。
-2. **启动栅格建图**：点击 **"Start Grid Mapper"**，系统将拉起离线栅格建图工具。
-3. **回放数据包**：点击 **"Start Playback"** 以 `--clock` 模式回放 Step 2 录制的 bag。系统会读取 bag 的 `metadata.yaml` 并显示预计总时长、已播放时间、剩余时间和进度条；播放完毕后（或手动点击 "Skip Playback Wait" 提前结束），点击 **"Stop All Nodes"** 停止所有节点。
-4. **生成检查**：系统自动扫描 `map.png`、`map.yaml`、`map_connections.txt`，并在界面上标记 `OK` 或 `MISSING`。
-5. **重命名并部署**：
-   * 点击 **"Rename"**：系统将自动把通用 `map.*` 重命名为专属的 `<map_name>.*` 并更新 YAML 文件内的路径关联。
-   * **GIMP 修正（可选）**：如果您需要用 GIMP 修改栅格地图，请勿改变其分辨率，修改完成后替换原图。
-   * 点击 **"Copy to maps/"** 将生成的地图部署到导航模块中。
-6. **编译导航**：点击 **"Rebuild Now"** 重新编译导航包以让新地图生效。编译命令如下：
-   ```bash
-   colcon build --packages-select multi_map_nav --cmake-args -Wno-dev -DCMAKE_EXPORT_COMPILE_COMMANDS=1 --symlink-install
-   ```
-   编译完成后进入 Step 4。
+### Step 2: 在线多楼层建图
+1. **启动在线栅格建图**：SLAM 就绪后，点击 **"启动在线栅格建图"**。界面会归档之前的 `data/Output/multi_maps`，再启动 GridMapper。
+2. **录制数据包**：GridMapper 启动后开始录制 `/livox/lidar` 与 `/imu/data` 原始数据，便于建图失败后离线排错；录包不再用于建图流程。
+3. **切换楼层**：行走到楼梯、电梯、门或走廊入口时，在“多楼层地图切换”区确认目标 ID（默认依次为 `map_000`、`map_001`…）、通道类型和是否双向；UI 立即调用 `/switch_map`。
+4. **结束与部署**：结束建图后，UI 停止录包并保存 GridMapper 与 PGO 输出，校验每张 `map_*.png/yaml`、`states/*.gridmap.bin`、两个 CSV 后，原子发布到 `~/Workspace/Maps/<项目>/`。无需重新编译导航包。
 
 ### Step 4: 流程结束与后台清理
 * 界面会扫描当前是否还有残留的后台会话。
@@ -109,12 +113,17 @@ Web 界面采用三行式仪表盘布局，操作高度解耦，确保前台交�
 | 用途 | 实际名称 / 路径 |
 | --- | --- |
 | Bag 录制目录 | `~/bags/<map_name>_sensor/` |
-| PGO prior 目录 | `faster-slam/prior/<map_name>/` |
-| 重定位参数 | `prior_dir:=<map_name>` |
-| 栅格地图文件 | `<map_name>.png`、`<map_name>.yaml`、`<map_name>.txt` |
-| 导航 maps 部署 | `multi_map_nav_ros2/maps/<map_name>.png`、`<map_name>.yaml` |
+| PGO prior（流程中） | `faster-slam/prior/<map_name>/` |
+| 最终定位 prior | `~/Maps/<map_name>/PGO.pcd`、`keyframes/` |
+| 多楼层地图 | `~/Maps/<map_name>/map_000.*`、`map_001.*`… |
+| 拓扑元数据 | `~/Maps/<map_name>/map_relations.csv`、`transition_points.csv` |
 
-因此地图名必须保持简单稳定，避免特殊字符造成 shell 命令、ROS launch 参数或文件路径解析失败。
+导航示例（无需编译或复制到 ROS package）：
+```bash
+ros2 launch multi_map_nav multi_map_nav.launch.py \
+  multi_map_dir:=~/Maps/<map_name> initial_map:=map_000 use_sim_time:=true
+```
+重定位使用同一项目目录：`prior_dir:=~/Maps/<map_name>`。因此项目名必须保持简单稳定，避免特殊字符造成 shell 命令、ROS launch 参数或文件路径解析失败。
 
 ### 2. 启动 SLAM 或其它节点时提示 "laser_mapping not detected" 并超时闪退？
 * **可能原因**：由于频繁启动和非正常退出，后台可能残留了双叉的 ROS2 孤儿进程，占满了同一个 DDS Domain 下的参与者席位（CycloneDDS 限制）。
