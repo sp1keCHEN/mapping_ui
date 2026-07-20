@@ -4,8 +4,8 @@ import streamlit as st
 
 TRANSLATIONS: dict[str, dict[str, str]] = {
     # ── Page / Sidebar ───────────────────────────────────────────────
-    "page_title":           {"en": "Mapping Scripts",           "zh": "建图工具"},
-    "sidebar_title":        {"en": "Mapping",                   "zh": "建图流程"},
+    "page_title":           {"en": "Multi-Floor Mapping",       "zh": "多楼层建图"},
+    "sidebar_title":        {"en": "Workflow",                  "zh": "建图流程"},
     "file_paths":           {"en": "File Paths",                "zh": "文件路径"},
     "language":             {"en": "Language",                   "zh": "语言"},
     "tbd":                  {"en": "(TBD)",                      "zh": "（待定）"},
@@ -17,8 +17,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "path_bag":             {"en": "Bag",                        "zh": "Bag"},
     "path_grid_map":        {"en": "Grid map",                   "zh": "栅格地图"},
     "path_nav_maps":        {"en": "Nav maps",                   "zh": "导航地图"},
-    "abort_mapping":        {"en": "Abort Mapping",             "zh": "终止建图"},
-    "abort_done":           {"en": "ABORT: All sessions stopped", "zh": "终止：所有会话已停止"},
+    "abort_mapping":        {"en": "Terminate Workflow",         "zh": "终止建图流程"},
+    "abort_done":           {"en": "Workflow terminated; all sessions stopped", "zh": "建图流程已终止，所有会话均已停止"},
 
     # ── Refresh warning ──────────────────────────────────────────────
     "refresh_warn_title":   {"en": "⚠️ Active Sessions Detected",
@@ -33,28 +33,28 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "dismiss":              {"en": "Dismiss",                   "zh": "忽略"},
 
     # ── Step names ───────────────────────────────────────────────────
-    "step0_name":           {"en": "Init",                      "zh": "初始化"},
-    "step1_name":           {"en": "Loop 1 Sensors",            "zh": "第一圈传感器"},
-    "step2_name":           {"en": "Loop 1 PGO",                "zh": "第一圈 PGO"},
-    "step3_name":           {"en": "Loop 2 Multi-Map",          "zh": "第二圈多地图"},
+    "step0_name":           {"en": "Initialize",                "zh": "初始化"},
+    "step1_name":           {"en": "Pass 1 Preparation",        "zh": "第一圈准备"},
+    "step2_name":           {"en": "Pass 1 PGO Review",         "zh": "第一圈 PGO 与审核"},
+    "step3_name":           {"en": "Pass 2 Multi-Floor Mapping", "zh": "第二圈多楼层建图"},
     "step4_name":           {"en": "Complete",                  "zh": "完成"},
 
     # ── Step 0 ───────────────────────────────────────────────────────
     "s0_header":            {"en": "Step 0: Initialization",    "zh": "步骤 0：初始化"},
     "s0_setup_missing":     {"en": "install/setup.bash not found. Source it or rebuild first.",
                              "zh": "未找到 install/setup.bash，请先 source 或重新编译。"},
-    "s0_desc":              {"en": """This tool guides you through the full mapping workflow:
+    "s0_desc":              {"en": """This workflow uses two independent passes:
 
-1. **Sensor Setup** — Start Livox Lidar and nav_bridge IMU
-2. **PGO SLAM** — 3D pointcloud map construction
-3. **Loop 1 PGO** — Build and review the loop-closed PCD while recording a debug bag
-4. **Loop 2 Multi-Map** — Relocalize against that PCD and create floor maps online""",
-                             "zh": """本工具引导你完成完整的建图流程：
+1. **Pass 1 — PGO prior acquisition:** collect a loop-closed point cloud and a diagnostic ROS bag.
+2. **PCD review:** confirm coverage and loop closure, then save the prior.
+3. **Pass 2 — relocalized multi-floor mapping:** relocalize against the confirmed prior and create GridMapper floor maps online.
+4. **Validation and deployment:** publish the complete navigation project without rebuilding ROS packages.""",
+                             "zh": """本流程由相互独立的两圈建图组成：
 
-1. **传感器启动** — 启动 Livox 激光雷达和 nav_bridge IMU
-2. **三维建图** — 基于 PGO 的三维点云地图构建
-3. **第一圈 PGO** — 生成并审核回环优化 PCD，同时录制排错 bag
-4. **第二圈多地图** — 基于该 PCD 重定位并在线创建楼层地图"""},
+1. **第一圈：PGO 定位先验采集**——生成回环优化点云并录制诊断 ROS bag。
+2. **PCD 审核**——确认覆盖范围和回环质量后保存定位先验。
+3. **第二圈：重定位多楼层建图**——基于已确认先验重定位，在线生成 GridMapper 楼层地图。
+4. **校验与部署**——发布完整导航地图项目，无需重新编译 ROS 软件包。"""},
     "start_workflow":       {"en": "Start Workflow",            "zh": "开始建图"},
 
     # ── Step 1 ───────────────────────────────────────────────────────
@@ -72,9 +72,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "s1_start_nav":         {"en": "Start nav_bridge",          "zh": "启动 nav_bridge"},
     "s1_start_nav_desc":    {"en": "**Start the nav_bridge IMU node.**",
                              "zh": "**启动 nav_bridge IMU 节点。**"},
-    "s1_release":           {"en": "Release Control",           "zh": "释放遥控权"},
-    "s1_release_desc":      {"en": "**Release remote control so the robot accepts commands.**",
-                             "zh": "**释放遥控器控制，以便遥控器操控建图。**"},
+    "s1_release":           {"en": "Release Platform Control",  "zh": "释放底盘控制权"},
+    "s1_release_desc":      {"en": "Release platform control before operating the robot with the remote controller.",
+                             "zh": "请先释放底盘控制权，再使用遥控器操控机器狗。"},
 
     # ── Step 2 ───────────────────────────────────────────────────────
     "s2_header":            {"en": "Step 2: PGO SLAM — 3D Pointcloud Map",
@@ -227,8 +227,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "empty":                {"en": "(empty)",                     "zh": "（空）"},
     "s2_start_record_desc": {"en": "**Start recording** `{livox}` and `{imu}` to bag `{bag}`.",
                              "zh": "**开始录制** `{livox}` 和 `{imu}` 到 bag `{bag}`。"},
-    "s2_slam_status":       {"en": "**SLAM:** {status}",          "zh": "**SLAM：** {status}"},
-    "s2_bag_recording_status": {"en": "**Bag recording:** {status}", "zh": "**Bag 录制：** {status}"},
+    "s2_slam_status":       {"en": "PGO SLAM",                    "zh": "PGO SLAM"},
+    "s2_bag_recording_status": {"en": "Diagnostic bag",            "zh": "诊断 ROS bag"},
     "s2_pgo_pcd_ok":        {"en": "**PGO.pcd:** OK ({size})",   "zh": "**PGO.pcd：** 正常（{size}）"},
     "s2_pgo_pcd_wait":      {"en": "**PGO.pcd:** waiting...",    "zh": "**PGO.pcd：** 等待中..."},
     "s2_keyframes_status":  {"en": "**keyframes/**: {status}",   "zh": "**keyframes/**：{status}"},
@@ -250,9 +250,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                               "zh": "**停止实时传感器节点，并使用 prior 地图启动重定位。**"},
     "s3_wait_node":         {"en": "Waiting for `{node}` node... ({elapsed:.0f}s / {seconds}s)",
                              "zh": "等待 `{node}` 节点中... ({elapsed:.0f}s / {seconds}s)"},
-    "s3_relocal_status":    {"en": "**Relocalization:** {status}", "zh": "**重定位：** {status}"},
+    "s3_relocal_status":    {"en": "Relocalization",              "zh": "重定位"},
     "s3_start_grid_desc":   {"en": "**Start the grid mapper + Rviz.**", "zh": "**启动栅格建图。**"},
-    "s3_grid_status":       {"en": "**Grid Mapper:** {status}",  "zh": "**栅格建图：** {status}"},
+    "s3_grid_status":       {"en": "GridMapper",                  "zh": "GridMapper"},
     "s3_wait_rviz":         {"en": "**Wait for Rviz to load**, then click below.", "zh": "**等待 Rviz 加载完成**，然后点击下方按钮。"},
     "s3_play_desc":         {"en": "**Play the recorded bag** with `--clock`.", "zh": "**使用 `--clock` 回放已录制的 bag。**"},
     "s3_manual_play":       {"en": "**Manually run:** `ros2 bag play <your_bag>/ --clock`", "zh": "**手动运行：**`ros2 bag play <your_bag>/ --clock`"},
@@ -313,9 +313,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "msg_project_deployed": {"en": "Mapping project deployed to {path}", "zh": "建图项目已部署到 {path}"},
 
     # ── Two-loop online mapping ───────────────────────────────────────
-    "two_loop_first_sensors": {"en": "Pass 1: Global Point-Cloud Acquisition", "zh": "第一圈：全局点云采集"},
-    "two_loop_first_sensors_desc": {"en": "Start the lidar and IMU for the PGO loop. GridMapper is deliberately not started in this loop.",
-                                     "zh": "启动用于第一圈 PGO 建图的雷达和 IMU。本阶段不启动 GridMapper。"},
+    "two_loop_first_sensors": {"en": "Pass 1: Sensor Preparation", "zh": "第一圈：传感器准备"},
+    "two_loop_first_sensors_desc": {"en": "Prepare the lidar, IMU bridge, and platform control for PGO prior acquisition. GridMapper is not used in this pass.",
+                                     "zh": "为 PGO 定位先验采集准备激光雷达、IMU 桥接和底盘控制权。本圈不使用 GridMapper。"},
     "two_loop_first_pgo": {"en": "Pass 1: PGO Global Point Cloud", "zh": "第一圈：PGO 全局点云建图"},
     "two_loop_project_notice": {"en": "This project name is shared by the first-loop PCD, debug bag, second-loop maps, and final deployment.",
                                   "zh": "项目名会贯穿第一圈 PCD、排错 bag、第二圈地图和最终部署目录。"},
@@ -336,19 +336,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                    "zh": "确认回环和覆盖范围无误后再继续。确认会保存 prior 并关闭第一圈剩余传感器节点。"},
     "two_loop_confirm_pcd": {"en": "PCD Is Correct — Save and Start Loop 2", "zh": "PCD 无误 — 保存并进入第二圈"},
     "two_loop_second_header": {"en": "Pass 2: Relocalized Multi-Floor Grid Mapping", "zh": "第二圈：重定位多楼层栅格建图"},
-    "two_loop_second_desc": {"en": "Restart sensors for the second loop. Faster-LIO will relocalize against the confirmed PCD; PGO remains off.",
-                              "zh": "为第二圈重新启动传感器。Faster-LIO 将基于已确认 PCD 重定位，不运行 PGO。"},
+    "two_loop_second_desc": {"en": "Prepare the lidar, IMU bridge, and platform control for relocalized mapping. Faster-LIO uses the confirmed PCD; PGO remains disabled.",
+                              "zh": "为重定位建图准备激光雷达、IMU 桥接和底盘控制权。Faster-LIO 使用已确认 PCD，PGO 保持关闭。"},
     "two_loop_start_relocal": {"en": "Start Relocalized Faster-LIO", "zh": "启动重定位 Faster-LIO"},
-    "two_loop_release_second_desc": {"en": "Release platform control before starting relocalized mapping.",
-                                      "zh": "启动重定位建图前，请先释放底盘控制权。"},
-    "two_loop_release_second": {"en": "Release Platform Control", "zh": "释放底盘控制权"},
     "two_loop_start_grid": {"en": "Start GridMapper", "zh": "启动 GridMapper"},
     "two_loop_second_drive_desc": {"en": "Drive the second loop and switch maps at stairs, doors, elevators, or corridors. No ROS bag is recorded in this loop.",
                                     "zh": "完成第二圈行走，在楼梯、门、电梯或走廊处切图。本圈不录制 ROS bag。"},
     "two_loop_finish_second": {"en": "Finish Loop 2 and Deploy Maps", "zh": "完成第二圈并部署地图"},
     "two_loop_recheck": {"en": "Recheck Multi-Map Output", "zh": "重新检查多地图输出"},
-    "two_loop_input_status": {"en": "**GridMapper input:** cloud {cloud_hz:.1f} Hz · odometry {odom_hz:.1f} Hz",
-                               "zh": "**GridMapper 输入：**点云 {cloud_hz:.1f} Hz · 里程计 {odom_hz:.1f} Hz"},
+    "two_loop_input_status": {"en": "GridMapper input: cloud {cloud_hz:.1f} Hz · odometry {odom_hz:.1f} Hz",
+                               "zh": "GridMapper 输入：点云 {cloud_hz:.1f} Hz · 里程计 {odom_hz:.1f} Hz"},
     "two_loop_input_ready": {"en": "Synchronized point-cloud and odometry input is active.",
                               "zh": "同步点云与里程计输入已激活。"},
     "two_loop_enter_mapping": {"en": "Enter Multi-Floor Mapping", "zh": "进入多楼层建图"},
