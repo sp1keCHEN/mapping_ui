@@ -2,11 +2,12 @@
 """Streamlit UI for interactive ROS2 mapping workflow.
 
 Layout:
-  - Sidebar: step progress, file paths, abort
-  - Left panel: screen session management (independent of workflow)
-  - Right panel: mapping workflow steps
+  - Sidebar: workflow progress, paths, and termination control
+  - Top row: mapping workflow and operational messages
+  - Bottom: active screen session controls and terminal log
 """
 
+import threading
 import os
 import re
 import shutil
@@ -36,7 +37,7 @@ from pcd_preview import load_xyz, preview_summary, topdown_image
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="Mapping Scripts", layout="wide")
+st.set_page_config(page_title="Multi-Floor Mapping", layout="wide", initial_sidebar_state="expanded")
 
 # Language selector — must be before any t() call
 if "lang" not in st.session_state:
@@ -321,9 +322,6 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub('', text)
 
 
-
-
-
 def screen_read_log(name: str, max_lines: int = 100) -> str:
     info = _get_session(name)
     if not info or not info.get("log_file"):
@@ -362,9 +360,6 @@ def screen_read_log_full(name: str) -> str:
         return _strip_ansi(Path(info["log_file"]).read_text())
     except FileNotFoundError:
         return ""
-
-
-
 
 
 _init_sessions()
@@ -507,13 +502,13 @@ def get_resolved_paths():
 
     faster_lio_path = get_package_path("faster_lio")
     faster_lio = faster_lio_path if faster_lio_path else (ALGOR_WS / "faster-slam")
-    
+
     gridmapper_path = get_package_path("gridmapper")
     gridmapper = gridmapper_path if gridmapper_path else (ALGOR_WS / "gridmapper")
-    
+
     multi_map_nav_path = get_package_path("multi_map_nav")
     multi_map_nav = multi_map_nav_path if multi_map_nav_path else (ALGOR_WS / "multi_map_nav_ros2")
-    
+
     res = {
         "FASTER_SLAM": faster_lio,
         "PGO_OUTPUT": faster_lio / "data" / "PGO_output",
@@ -521,7 +516,7 @@ def get_resolved_paths():
         "GRIDMAPPER_OUTPUT": gridmapper / "data" / "Output",
         "MULTI_MAP_OUTPUT": gridmapper / "data" / "Output" / "multi_maps",
     }
-    
+
     print("--- ROS2 Package Path Resolution (Cached) ---")
     print(f"  FASTER_SLAM: {res['FASTER_SLAM']}")
     print(f"  PGO_OUTPUT: {res['PGO_OUTPUT']}")
@@ -561,8 +556,6 @@ def check_node_exists(node_name: str) -> bool:
     output = run_ros2_cmd("ros2 node list", timeout=2)
     return output is not None and node_name in output
 
-
-import threading
 
 @st.cache_resource
 def get_monitor_manager():
@@ -808,22 +801,22 @@ def clear_wait_state():
         del st.session_state.wait_start
 
 
-def render_sensor_preparation(loop: str, intro_key: str, next_phase: str) -> bool:
-    """Render the shared sensor and platform-control preparation sequence.
+def render_initial_preparation(next_phase: str) -> bool:
+    """Render the one-time sensor and platform-control preparation sequence.
 
     Returns True while the sequence owns the current workflow phase.
     """
     sub = st.session_state.current_sub
     phases = {
-        "start_livox": f"{loop}_livox",
-        "wait_livox": f"wait_{loop}_livox",
-        "start_nav": f"{loop}_nav",
-        "wait_nav": f"wait_{loop}_nav",
-        "release": f"{loop}_release" if loop == "first" else f"{loop}_release_control",
+        "start_livox": "first_livox",
+        "wait_livox": "wait_first_livox",
+        "start_nav": "first_nav",
+        "wait_nav": "wait_first_nav",
+        "release": "first_release",
     }
     if sub == phases["start_livox"]:
-        st.markdown(t(intro_key))
-        if st.button(t("s1_start_livox"), type="primary", key=f"{loop}_livox"):
+        st.markdown(t("two_loop_first_sensors_desc"))
+        if st.button(t("s1_start_livox"), type="primary", key="first_livox"):
             add_message(t("msg_start_livox"))
             screen_launch("livox", LIVOX_LAUNCH_CMD)
             st.session_state.current_sub = phases["wait_livox"]
@@ -841,7 +834,7 @@ def render_sensor_preparation(loop: str, intro_key: str, next_phase: str) -> boo
         return True
     if sub == phases["start_nav"]:
         st.markdown(t("s1_start_nav_desc"))
-        if st.button(t("s1_start_nav"), type="primary", key=f"{loop}_nav"):
+        if st.button(t("s1_start_nav"), type="primary", key="first_nav"):
             add_message(t("msg_start_nav"))
             screen_launch("nav_bridge", NAV_BRIDGE_LAUNCH_CMD)
             st.session_state.current_sub = phases["wait_nav"]
@@ -859,13 +852,20 @@ def render_sensor_preparation(loop: str, intro_key: str, next_phase: str) -> boo
         return True
     if sub == phases["release"]:
         st.markdown(t("s1_release_desc"))
-        if st.button(t("s1_release"), type="primary", key=f"{loop}_release"):
+        if st.button(t("s1_release"), type="primary", key="first_release"):
             output = run_ros2_cmd("ros2 service call /nav_bridge_node/release_control std_srvs/srv/Trigger")
             add_message(t("msg_release_done", output=output or t("ok")))
             st.session_state.current_sub = next_phase
             st.rerun()
         return True
     return False
+
+
+def render_node_wait(node_name: str, elapsed: float, timeout: int = 30) -> None:
+    """Render the consistent bounded wait state used for ROS node startup."""
+    st.progress(min(elapsed / timeout, 1.0))
+    st.caption(t("s3_wait_node", node=node_name,
+               elapsed=elapsed, seconds=timeout))
 
 
 def render_runtime_status(**sessions: str) -> None:
@@ -961,6 +961,8 @@ def render_sidebar():
         st.rerun()
 
     st.sidebar.divider()
+    st.sidebar.progress(st.session_state.current_step / 4)
+    st.sidebar.caption(t("workflow_progress", current=st.session_state.current_step, total=4))
 
     for sdef in _step_defs():
         sid = sdef["id"]
@@ -994,8 +996,6 @@ def render_sidebar():
             st.session_state.current_step = 0
             st.session_state.current_sub = "start"
             st.rerun()
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1121,7 +1121,6 @@ def render_step0():
         st.rerun()
 
 
-
 def render_multimap_controls() -> None:
     """Show live GridMapper output and safely call its map-switch service."""
     report = inspect_multimap_dir(
@@ -1181,7 +1180,6 @@ def render_multimap_controls() -> None:
             st.error(str(exc))
         st.rerun()
     st.caption(t("s3_active_map", map=st.session_state.active_map_id))
-
 
 
 def render_step4():
@@ -1245,7 +1243,7 @@ def render_step4():
 def render_first_loop_sensors():
     """First-loop sensor preparation."""
     st.header(t("two_loop_first_sensors"))
-    if render_sensor_preparation("first", "two_loop_first_sensors_desc", "first_name"):
+    if render_initial_preparation("first_name"):
         return
     st.session_state.current_step = 2
     if not st.session_state.map_name:
@@ -1301,20 +1299,15 @@ def render_first_loop_pgo():
             st.rerun()
     elif sub == "wait_first_slam":
         elapsed = max(0.0, time.monotonic() - get_wait_start())
-        st.progress(min(elapsed / 30, 1.0))
-        st.caption(t("s3_wait_node", node="laser_mapping", elapsed=elapsed, seconds=30))
+        render_node_wait("laser_mapping", elapsed)
         if check_node_exists("laser_mapping") or elapsed >= 30:
-            st.session_state.current_sub = "first_bag"
-            clear_wait_state()
-            st.rerun()
-    elif sub == "first_bag":
-        bag_name = f"{project}_first_sensor"
-        st.markdown(t("two_loop_first_bag_desc", bag=bag_name))
-        if st.button(t("s2_start_rec"), type="primary", key="two_first_bag"):
+            bag_name = f"{project}_first_sensor"
             BAGS_DIR.mkdir(parents=True, exist_ok=True)
             screen_launch("bag_rec", f"ros2 bag record -o {shlex.quote(bag_name)} {LIVOX_TOPIC} {IMU_TOPIC}", cwd=str(BAGS_DIR))
-            st.session_state.bag_name, st.session_state.current_sub = bag_name, "first_drive"
+            st.session_state.bag_name = bag_name
             add_message(t("msg_record_to", path=f"{BAGS_DIR}/{bag_name}"))
+            st.session_state.current_sub = "first_drive"
+            clear_wait_state()
             st.rerun()
     elif sub == "first_drive":
         st.info(t("two_loop_first_drive_desc"))
@@ -1355,10 +1348,9 @@ def render_first_loop_pgo():
                 add_message(message)
             if any(message.startswith(("ERROR:", "错误：")) for message in messages):
                 return
-            for name in ("bag_rec", "slam", "livox", "nav_bridge"):
+            for name in ("bag_rec", "slam"):
                 screen_stop(name)
-            get_monitor_manager().reset()
-            st.session_state.current_step, st.session_state.current_sub = 3, "second_livox"
+            st.session_state.current_step, st.session_state.current_sub = 3, "second_relocal"
             st.rerun()
 
 
@@ -1370,32 +1362,30 @@ def render_second_loop_mapping():
     if not (prior / "PGO.pcd").is_file():
         st.error(t("msg_error_not_found", path=prior / "PGO.pcd"))
         return
-    if render_sensor_preparation("second", "two_loop_second_desc", "second_relocal"):
-        return
     if sub == "second_relocal":
-        st.code(RELOCAL_LAUNCH_CMD.format(prior=prior))
+        st.markdown(t("two_loop_start_relocal_desc", prior=prior))
+        st.warning(t("s3_archive_notice", output=MULTI_MAP_OUTPUT))
         if st.button(t("two_loop_start_relocal"), type="primary", key="two_second_relocal"):
             screen_launch("relocal", RELOCAL_LAUNCH_CMD.format(prior=prior))
             st.session_state.current_sub, st.session_state.wait_start = "wait_second_relocal", time.monotonic()
             st.rerun()
     elif sub == "wait_second_relocal":
-        if check_node_exists("laser_mapping") or time.monotonic() - get_wait_start() >= 30:
-            st.session_state.current_sub = "second_grid"
-            clear_wait_state()
-            st.rerun()
-    elif sub == "second_grid":
-        st.warning(t("s3_archive_notice", output=MULTI_MAP_OUTPUT))
-        if st.button(t("two_loop_start_grid"), type="primary", key="two_second_grid"):
+        elapsed = max(0.0, time.monotonic() - get_wait_start())
+        render_node_wait("laser_mapping", elapsed)
+        if check_node_exists("laser_mapping") or elapsed >= 30:
             archived = archive_previous_output(GRIDMAPPER_OUTPUT)
             if archived:
                 add_message(t("msg_multimap_archived", path=archived))
             st.session_state.active_map_id = "map_000"
             st.session_state.switch_target_map = next_map_id_after("map_000")
             screen_launch("gridmapper", GRIDMAPPER_LAUNCH_CMD)
+            add_message(t("msg_start_grid"))
             st.session_state.current_sub, st.session_state.wait_start = "wait_second_grid", time.monotonic()
             st.rerun()
     elif sub == "wait_second_grid":
-        if check_node_exists("gridmapper_node") or time.monotonic() - get_wait_start() >= 30:
+        elapsed = max(0.0, time.monotonic() - get_wait_start())
+        render_node_wait("gridmapper_node", elapsed)
+        if check_node_exists("gridmapper_node") or elapsed >= 30:
             st.session_state.current_sub = "second_wait_inputs"
             clear_wait_state()
             st.rerun()
@@ -1405,9 +1395,8 @@ def render_second_loop_mapping():
         st.markdown(t("two_loop_input_status", cloud_hz=cloud_hz, odom_hz=odom_hz))
         if cloud_hz > 0 and odom_hz > 0:
             st.success(t("two_loop_input_ready"))
-            if st.button(t("two_loop_enter_mapping"), type="primary", key="two_inputs_ready"):
-                st.session_state.current_sub = "second_drive"
-                st.rerun()
+            st.session_state.current_sub = "second_drive"
+            st.rerun()
         else:
             st.warning(t("two_loop_input_wait"))
             st.caption(t("two_loop_input_diagnose"))
@@ -1419,8 +1408,6 @@ def render_second_loop_mapping():
             if _session_alive("gridmapper"):
                 _send_ctrl_c("gridmapper")
                 add_message(t("msg_send_grid_sigint"))
-            for name in ("relocal", "livox", "nav_bridge"):
-                screen_stop(name)
             st.session_state.current_sub, st.session_state.wait_start = "wait_second_output", time.monotonic()
             st.rerun()
     elif sub == "wait_second_output":
