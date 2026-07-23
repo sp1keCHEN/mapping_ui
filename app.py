@@ -65,6 +65,7 @@ NAV_BRIDGE_LAUNCH_CMD = "ros2 launch nav_bridge nav_bridge.launch.py"
 SLAM_PGO_LAUNCH_CMD = "ros2 launch faster_lio slam.launch.py pgo:=true rviz:=false"
 RELOCAL_LAUNCH_CMD = "ros2 launch faster_lio slam.launch.py relocal:=true prior_dir:={prior}"
 GRIDMAPPER_LAUNCH_CMD = "ros2 launch gridmapper global.launch.py rviz:=false"
+CONTEXT_RECORDER_CMD = "ros2 run map_context_tracker map_context_recorder --ros-args -p output_dir:={output_dir}"
 
 LIVOX_TOPIC = "/livox/lidar"
 IMU_TOPIC = "/imu/data"
@@ -140,6 +141,7 @@ KNOWN_SESSIONS = [
     {"name": "bag_rec", "label": "Bag Recording", "expected_nodes": []},
     {"name": "relocal", "label": "Relocalization", "expected_nodes": ["/laser_mapping"]},
     {"name": "gridmapper", "label": "Grid Mapper + Rviz", "expected_nodes": ["/gridmapper_node"]},
+    {"name": "map_context_recorder", "label": "Map Context Recorder", "expected_nodes": ["/map_context_recorder"]},
     {"name": "bag_play", "label": "Bag Playback", "expected_nodes": []},
     {"name": "build", "label": "colcon Build", "expected_nodes": []},
 ]
@@ -1379,6 +1381,11 @@ def render_second_loop_mapping():
             st.session_state.active_map_id = "map_000"
             st.session_state.switch_target_map = next_map_id_after("map_000")
             screen_launch("gridmapper", GRIDMAPPER_LAUNCH_CMD)
+            try:
+                screen_launch("map_context_recorder", CONTEXT_RECORDER_CMD.format(output_dir=shlex.quote(str(MULTI_MAP_OUTPUT))))
+                add_message(t("msg_context_recorder_started"))
+            except OSError as exc:
+                add_message(t("msg_context_recorder_failed", error=exc))
             add_message(t("msg_start_grid"))
             st.session_state.current_sub, st.session_state.wait_start = "wait_second_grid", time.monotonic()
             st.rerun()
@@ -1408,6 +1415,9 @@ def render_second_loop_mapping():
             if _session_alive("gridmapper"):
                 _send_ctrl_c("gridmapper")
                 add_message(t("msg_send_grid_sigint"))
+            if _session_alive("map_context_recorder"):
+                screen_stop("map_context_recorder")
+                add_message(t("msg_context_recorder_stopped"))
             st.session_state.current_sub, st.session_state.wait_start = "wait_second_output", time.monotonic()
             st.rerun()
     elif sub == "wait_second_output":
@@ -1430,6 +1440,11 @@ def render_second_loop_mapping():
             st.session_state.current_sub = "second_validation_error"
             st.rerun()
         st.success(t("two_loop_maps_valid", maps=", ".join(report.map_ids), relations=report.relations_count, transitions=report.transitions_count))
+        context_path = MULTI_MAP_OUTPUT / "context" / "inspection_context.yaml"
+        if context_path.is_file():
+            st.success(t("two_loop_context_ready", path=context_path))
+        else:
+            st.warning(t("two_loop_context_missing", path=context_path))
         selected_map = st.selectbox(t("two_loop_preview_floor"), report.map_ids, key="second_preview_map")
         st.image(str(MULTI_MAP_OUTPUT / f"{selected_map}.png"), caption=t("two_loop_preview_caption", map_id=selected_map), width="stretch")
         st.info(t("two_loop_review_maps_desc", destination=MAPS_ROOT / project))

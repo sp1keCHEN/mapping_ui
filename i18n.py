@@ -106,6 +106,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     'msg_pgo_ready': {'en': 'PGO output ready and stable', 'zh': 'PGO 输出已就绪且稳定'},
     'msg_pgo_timeout': {'en': 'WARN: PGO output not ready after {seconds}s', 'zh': '警告：{seconds}s 后 PGO 输出仍未就绪'},
     'msg_start_grid': {'en': 'Starting global grid mapper + Rviz...', 'zh': '正在启动全局栅格建图...'},
+    'msg_context_recorder_started': {'en': 'Map context recorder started.', 'zh': '地图上下文记录器已启动。'},
+    'msg_context_recorder_stopped': {'en': 'Map context recorder stopped and is writing metadata.', 'zh': '地图上下文记录器已停止，正在写入元数据。'},
+    'msg_context_recorder_failed': {'en': 'WARN: map context recorder could not start: {error}', 'zh': '警告：地图上下文记录器启动失败：{error}'},
     'msg_send_grid_sigint': {'en': 'Sending SIGINT to gridmapper (saving map files)...',
                              'zh': '正在向 gridmapper 发送 SIGINT（保存地图文件）...'},
     'msg_grid_ready': {'en': 'Gridmapper output files ready', 'zh': 'gridmapper 输出文件已就绪'},
@@ -180,6 +183,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     'two_loop_maps_valid': {'en': 'Multi-floor map output is valid: {maps} ({relations} relations, {transitions} '
                             'transition points).',
                             'zh': '多楼层地图输出校验通过：{maps}（{relations} 条地图关系，{transitions} 个传送点）。'},
+    'two_loop_context_ready': {'en': 'Map-context metadata is ready: `{path}`', 'zh': '地图上下文元数据已生成：`{path}`'},
+    'two_loop_context_missing': {'en': 'Map-context metadata is missing: `{path}`. Mapping deployment can continue, but this project cannot provide reliable manual-inspection localization.',
+                                 'zh': '未找到地图上下文元数据：`{path}`。可继续部署地图，但该项目无法提供可靠的人工巡检定位。'},
     'two_loop_preview_floor': {'en': 'Floor map to inspect', 'zh': '选择要检查的楼层地图'},
     'two_loop_preview_caption': {'en': '{map_id} occupancy map', 'zh': '{map_id} 栅格地图'},
     'two_loop_review_maps_desc': {'en': 'Inspect every floor map before deployment. After confirmation, the PGO prior and '

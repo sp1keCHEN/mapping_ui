@@ -49,6 +49,8 @@ class MultiMapTests(unittest.TestCase):
             tmp_path = Path(temp_dir)
             output = tmp_path / "output"
             write_map_bundle(output)
+            (output / "context").mkdir()
+            (output / "context" / "inspection_context.yaml").write_text("format_version: 1\n")
             self.assertTrue(inspect_multimap_dir(output).valid)
             prior = tmp_path / "prior"
             (prior / "keyframes").mkdir(parents=True)
@@ -57,6 +59,7 @@ class MultiMapTests(unittest.TestCase):
             target = deploy_project(prior, output, tmp_path / "Maps", "company2")
             self.assertTrue((target / "PGO.pcd").is_file())
             self.assertTrue((target / "map_000.yaml").is_file())
+            self.assertTrue((target / "context" / "inspection_context.yaml").is_file())
             self.assertTrue(inspect_multimap_dir(target).valid)
 
     def test_live_active_map_can_be_referenced_before_export(self):
