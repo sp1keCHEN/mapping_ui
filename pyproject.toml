@@ -4,5 +4,6 @@ version = "0.1.0"
 description = "Interactive ROS2 mapping workflow for X30 robot dog"
 requires-python = ">=3.10"
 dependencies = [
+    "Pillow>=10.0",
     "streamlit>=1.57.0",
 ]

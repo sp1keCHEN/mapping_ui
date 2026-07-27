@@ -12,7 +12,8 @@ from multimap import (
     next_map_id_after,
     switch_map_request,
 )
-from pcd_preview import load_xyz, preview_summary, topdown_image
+from map_preview import TRANSPARENT_AREA_COLOR, occupancy_preview
+from pcd_preview import load_xyz, preview_summary, three_view_images, topdown_image
 
 
 def write_map_bundle(root: Path) -> None:
@@ -21,12 +22,8 @@ def write_map_bundle(root: Path) -> None:
         (root / f"{map_id}.png").write_bytes(b"png")
         (root / f"{map_id}.yaml").write_text(f"image: {map_id}.png\n")
         (root / "states" / f"{map_id}.gridmap.bin").write_bytes(b"state")
-    (root / "map_relations.csv").write_text(
-        ",".join(RELATIONS_HEADER) + "\nROOT,map_000,0,0\nmap_000,map_001,1,2\n"
-    )
-    (root / "transition_points.csv").write_text(
-        ",".join(TRANSITIONS_HEADER) + "\ntp_1,map_000,map_001,1,2,0,0,true,stairs\n"
-    )
+    (root / "map_relations.csv").write_text(",".join(RELATIONS_HEADER) + "\nROOT,map_000,0,0\nmap_000,map_001,1,2\n")
+    (root / "transition_points.csv").write_text(",".join(TRANSITIONS_HEADER) + "\ntp_1,map_000,map_001,1,2,0,0,true,stairs\n")
 
 
 def write_binary_pcd(path: Path) -> None:
@@ -80,6 +77,20 @@ class MultiMapTests(unittest.TestCase):
             self.assertEqual(xyz.shape, (2, 3))
             self.assertEqual(preview_summary(xyz)["points"], 2)
             self.assertEqual(topdown_image(xyz, width=32, height=16).shape, (16, 32, 3))
+            self.assertEqual(set(three_view_images(xyz)), {"xy", "xz", "yz"})
+
+    def test_transparent_occupancy_pixels_use_distinct_display_color(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            png = Path(temp_dir) / "map.png"
+            image = Image.new("RGBA", (2, 1), (255, 255, 255, 255))
+            image.putpixel((1, 0), (0, 0, 0, 0))
+            image.save(png)
+            preview = occupancy_preview(png)
+            self.assertEqual(preview.mode, "RGB")
+            self.assertEqual(preview.getpixel((0, 0)), (255, 255, 255))
+            self.assertEqual(preview.getpixel((1, 0)), TRANSPARENT_AREA_COLOR[:3])
 
     def test_rejects_non_binary_pcd(self):
         with tempfile.TemporaryDirectory() as temp_dir:

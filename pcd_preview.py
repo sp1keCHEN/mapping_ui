@@ -1,4 +1,4 @@
-"""Small dependency-free reader and top-down preview for binary PCD files."""
+"""Small dependency-free reader and orthographic previews for binary PCD files."""
 
 from __future__ import annotations
 
@@ -76,13 +76,24 @@ def preview_summary(xyz: np.ndarray) -> dict[str, float | int]:
     }
 
 
-def topdown_image(xyz: np.ndarray, width: int = 900, height: int = 600) -> np.ndarray:
-    """Rasterize an XY top-down point-density preview without plotting packages."""
-    summary = preview_summary(xyz)
-    x_span = max(summary["x_max"] - summary["x_min"], 1e-3)
-    y_span = max(summary["y_max"] - summary["y_min"], 1e-3)
-    px = np.clip(((xyz[:, 0] - summary["x_min"]) / x_span * (width - 1)).astype(int), 0, width - 1)
-    py = np.clip(((xyz[:, 1] - summary["y_min"]) / y_span * (height - 1)).astype(int), 0, height - 1)
+def projection_image(
+    xyz: np.ndarray,
+    horizontal_axis: int,
+    vertical_axis: int,
+    width: int = 720,
+    height: int = 480,
+) -> np.ndarray:
+    """Rasterize an orthographic point-density preview for two XYZ axes."""
+    if horizontal_axis == vertical_axis or {horizontal_axis, vertical_axis} - {0, 1, 2}:
+        raise ValueError("projection axes must be two distinct XYZ indices")
+    if len(xyz) == 0:
+        raise ValueError("PCD contains no finite points")
+    horizontal = xyz[:, horizontal_axis]
+    vertical = xyz[:, vertical_axis]
+    horizontal_span = max(float(horizontal.max() - horizontal.min()), 1e-3)
+    vertical_span = max(float(vertical.max() - vertical.min()), 1e-3)
+    px = np.clip(((horizontal - horizontal.min()) / horizontal_span * (width - 1)).astype(int), 0, width - 1)
+    py = np.clip(((vertical - vertical.min()) / vertical_span * (height - 1)).astype(int), 0, height - 1)
     density = np.zeros((height, width), dtype=np.uint16)
     np.add.at(density, (height - 1 - py, px), 1)
     image = np.full((height, width, 3), 18, dtype=np.uint8)
@@ -91,3 +102,17 @@ def topdown_image(xyz: np.ndarray, width: int = 900, height: int = 600) -> np.nd
     image[..., 1] = (35 + strength * 185).astype(np.uint8)
     image[..., 2] = (45 + strength * 210).astype(np.uint8)
     return image
+
+
+def topdown_image(xyz: np.ndarray, width: int = 900, height: int = 600) -> np.ndarray:
+    """Backward-compatible XY top-down preview."""
+    return projection_image(xyz, 0, 1, width=width, height=height)
+
+
+def three_view_images(xyz: np.ndarray) -> dict[str, np.ndarray]:
+    """Return XY top, XZ front, and YZ side orthographic PCD previews."""
+    return {
+        "xy": projection_image(xyz, 0, 1),
+        "xz": projection_image(xyz, 0, 2),
+        "yz": projection_image(xyz, 1, 2),
+    }

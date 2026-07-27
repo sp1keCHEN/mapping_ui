@@ -32,7 +32,8 @@ from multimap import (
     read_multimap_tables,
     switch_map_request,
 )
-from pcd_preview import load_xyz, preview_summary, topdown_image
+from map_preview import occupancy_preview
+from pcd_preview import load_xyz, preview_summary, three_view_images
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -73,6 +74,7 @@ PGO_WAIT_TIMEOUT_SEC = 300
 PGO_STABLE_POLLS = 5
 PGO_EXIT_GRACE_SEC = 20
 MAP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
+CHECKPOINT_FILENAME = ".mapping_ui_checkpoint.json"
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -710,6 +712,64 @@ def copy_pgo_to_prior(map_name: str) -> list[str]:
     return messages
 
 
+def checkpoint_path(map_name: str) -> Path:
+    return PRIOR_DIR / map_name / CHECKPOINT_FILENAME
+
+
+def save_second_loop_checkpoint(map_name: str) -> None:
+    """Persist an approved first-loop prior so Pass 2 can be resumed later."""
+    path = checkpoint_path(map_name)
+    payload = {
+        "format_version": 1,
+        "project_name": map_name,
+        "stage": "pgo_approved",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def clear_second_loop_checkpoint(map_name: str) -> None:
+    checkpoint_path(map_name).unlink(missing_ok=True)
+
+
+def resumable_projects() -> list[str]:
+    """Return first-loop projects explicitly paused before second-loop mapping."""
+    if not PRIOR_DIR.is_dir():
+        return []
+    projects: list[str] = []
+    for directory in PRIOR_DIR.iterdir():
+        path = directory / CHECKPOINT_FILENAME
+        if not directory.is_dir() or not path.is_file():
+            continue
+        try:
+            checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            checkpoint.get("format_version") == 1
+            and checkpoint.get("project_name") == directory.name
+            and checkpoint.get("stage") == "pgo_approved"
+            and (directory / "PGO.pcd").is_file()
+            and (directory / "keyframes").is_dir()
+        ):
+            projects.append(directory.name)
+    return sorted(projects)
+
+
+def save_approved_prior(map_name: str) -> bool:
+    """Copy the reviewed PGO files and create a durable second-loop checkpoint."""
+    messages = copy_pgo_to_prior(map_name)
+    for message in messages:
+        add_message(message)
+    if any(message.startswith(("ERROR:", "错误：")) for message in messages):
+        return False
+    save_second_loop_checkpoint(map_name)
+    add_message(t("msg_second_loop_checkpoint", path=checkpoint_path(map_name)))
+    return True
+
+
 def archive_existing_pgo_output() -> list[str]:
     messages = []
     existing = [p for p in (PGO_OUTPUT / "PGO.pcd", PGO_OUTPUT / "keyframes") if p.exists()]
@@ -758,6 +818,7 @@ def _init_state():
         "active_map_id": "map_000",
         "switch_history": [],
         "last_switch_response": "",
+        "resume_second_loop": False,
         "selected_session": KNOWN_SESSIONS[0]["name"],
         "action_in_progress": False,
         "last_sub": "start",
@@ -1115,8 +1176,24 @@ def render_step0():
 
     st.markdown(t("s0_desc"))
 
+    paused = resumable_projects()
+    if paused:
+        st.divider()
+        st.subheader(t("resume_second_header"))
+        selected = st.selectbox(t("resume_second_project"), paused, key="resume_project")
+        st.caption(t("resume_second_details", prior=PRIOR_DIR / selected))
+        if st.button(t("resume_second_button"), type="primary", key="btn_resume_second"):
+            st.session_state.map_name = selected
+            st.session_state.resume_second_loop = True
+            st.session_state.current_step = 1
+            st.session_state.current_sub = "first_livox"
+            st.session_state.step_messages = []
+            add_message(t("msg_second_loop_resumed", name=selected))
+            st.rerun()
+
     if st.button(t("start_workflow"), type="primary", key="btn_step0_start", disabled=st.session_state.action_in_progress):
         st.session_state.action_in_progress = True
+        st.session_state.resume_second_loop = False
         st.session_state.current_step = 1
         st.session_state.current_sub = "first_livox"
         st.session_state.step_messages = []
@@ -1229,6 +1306,7 @@ def render_step4():
                 "active_map_id",
                 "switch_target_map",
                 "switch_history", "last_switch_response",
+                "resume_second_loop",
             ]
             for k in workflow_keys:
                 if k in st.session_state:
@@ -1245,8 +1323,18 @@ def render_step4():
 def render_first_loop_sensors():
     """First-loop sensor preparation."""
     st.header(t("two_loop_first_sensors"))
-    if render_initial_preparation("first_name"):
+    next_phase = "resume_second_ready" if st.session_state.resume_second_loop else "first_name"
+    if render_initial_preparation(next_phase):
         return
+    if st.session_state.resume_second_loop:
+        if st.session_state.current_sub == "resume_second_ready":
+            st.markdown(t("resume_second_stand_desc"))
+            if st.button(t("resume_second_stand_button"), type="primary", key="resume_second_stand"):
+                st.session_state.current_sub = "resume_second_launch"
+                st.rerun()
+            return
+        st.session_state.current_step, st.session_state.current_sub = 3, "second_relocal"
+        st.rerun()
     st.session_state.current_step = 2
     if not st.session_state.map_name:
         st.session_state.map_name = datetime.now().strftime("sensor_%y%m%d_%H%M%S")
@@ -1266,7 +1354,11 @@ def _render_pcd_review(pcd_path: Path) -> None:
         columns[1].caption(f"X：{summary['x_min']:.1f} ~ {summary['x_max']:.1f} m")
         columns[2].caption(f"Y：{summary['y_min']:.1f} ~ {summary['y_max']:.1f} m")
         columns[3].caption(f"Z：{summary['z_min']:.1f} ~ {summary['z_max']:.1f} m")
-        st.image(topdown_image(xyz), caption=t("two_loop_pcd_topdown"), width="stretch")
+        views = three_view_images(xyz)
+        top, front, side = st.columns(3)
+        top.image(views["xy"], caption=t("two_loop_pcd_xy"), width="stretch")
+        front.image(views["xz"], caption=t("two_loop_pcd_xz"), width="stretch")
+        side.image(views["yz"], caption=t("two_loop_pcd_yz"), width="stretch")
     except (OSError, ValueError) as exc:
         st.warning(t("two_loop_pcd_external", path=pcd_path, error=exc))
 
@@ -1344,15 +1436,25 @@ def render_first_loop_pgo():
     elif sub == "pcd_review":
         _render_pcd_review(PGO_OUTPUT / "PGO.pcd")
         st.info(t("two_loop_pcd_confirm_desc"))
-        if st.button(t("two_loop_confirm_pcd"), type="primary", key="two_confirm_pcd"):
-            messages = copy_pgo_to_prior(project)
-            for message in messages:
-                add_message(message)
-            if any(message.startswith(("ERROR:", "错误：")) for message in messages):
+        continue_col, pause_col = st.columns(2)
+        with continue_col:
+            continue_now = st.button(t("two_loop_confirm_pcd"), type="primary", key="two_confirm_pcd")
+        with pause_col:
+            pause_after_review = st.button(t("two_loop_pause_after_pcd"), key="two_pause_after_pcd")
+        if continue_now or pause_after_review:
+            if not save_approved_prior(project):
                 return
             for name in ("bag_rec", "slam"):
                 screen_stop(name)
-            st.session_state.current_step, st.session_state.current_sub = 3, "second_relocal"
+            if continue_now:
+                st.session_state.resume_second_loop = False
+                st.session_state.current_step, st.session_state.current_sub = 3, "second_relocal"
+            else:
+                for name in ("livox", "nav_bridge"):
+                    screen_stop(name)
+                st.session_state.resume_second_loop = False
+                st.session_state.current_step, st.session_state.current_sub = 0, "start"
+                add_message(t("msg_first_loop_paused", name=project))
             st.rerun()
 
 
@@ -1446,11 +1548,17 @@ def render_second_loop_mapping():
         else:
             st.warning(t("two_loop_context_missing", path=context_path))
         selected_map = st.selectbox(t("two_loop_preview_floor"), report.map_ids, key="second_preview_map")
-        st.image(str(MULTI_MAP_OUTPUT / f"{selected_map}.png"), caption=t("two_loop_preview_caption", map_id=selected_map), width="stretch")
+        st.caption(t("two_loop_preview_transparent"))
+        st.image(
+            occupancy_preview(MULTI_MAP_OUTPUT / f"{selected_map}.png"),
+            caption=t("two_loop_preview_caption", map_id=selected_map),
+            width="stretch",
+        )
         st.info(t("two_loop_review_maps_desc", destination=MAPS_ROOT / project))
         if st.button(t("two_loop_confirm_deploy"), type="primary", key="two_confirm_deploy"):
             try:
                 target = deploy_project(prior, MULTI_MAP_OUTPUT, MAPS_ROOT, project)
+                clear_second_loop_checkpoint(project)
                 add_message(t("msg_project_deployed", path=target))
                 st.session_state.current_step, st.session_state.current_sub = 4, "cleanup"
                 st.rerun()

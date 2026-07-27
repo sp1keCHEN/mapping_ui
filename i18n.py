@@ -50,6 +50,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                 '3. **第二圈：重定位多楼层建图**——基于已确认先验重定位，在线生成 GridMapper 楼层地图。\n'
                 '4. **校验与部署**——发布完整导航地图项目，无需重新编译 ROS 软件包。'},
     'start_workflow': {'en': 'Start Workflow', 'zh': '开始建图'},
+    'resume_second_header': {'en': 'Resume a Paused Second Loop', 'zh': '恢复已暂停的第二圈'},
+    'resume_second_project': {'en': 'Approved first-loop project', 'zh': '已确认第一圈项目'},
+    'resume_second_details': {'en': 'The saved prior will be loaded from `{prior}`. System readiness will run again before relocalization.',
+                              'zh': '将从 `{prior}` 加载已保存的定位先验。进入重定位前需要重新完成系统就绪流程。'},
+    'resume_second_button': {'en': 'Prepare System and Resume Pass 2', 'zh': '准备系统并恢复第二圈'},
+    'resume_second_stand_desc': {'en': '**Use the remote controller to stand up the robot again.** Continue only after it is stable.',
+                                 'zh': '**请再次使用遥控器控制机器人站立。** 确认站立稳定后再继续。'},
+    'resume_second_stand_button': {'en': 'Robot is Standing — Enter Pass 2', 'zh': '机器人已站立 — 进入第二圈'},
     's1_start_livox': {'en': 'Start Livox Lidar', 'zh': '启动激光雷达'},
     's1_wait_topic': {'en': 'Waiting for {topic} data... ({elapsed:.0f}s / 20s)',
                       'zh': '等待 {topic} 数据中… ({elapsed:.0f}s / 20s)'},
@@ -144,6 +152,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                              'input status to become ready.',
                              'zh': '警告：GridMapper 尚未收到同步里程计；请等待第二圈输入状态就绪后再切图。'},
     'msg_project_deployed': {'en': 'Mapping project deployed to {path}', 'zh': '建图项目已部署到 {path}'},
+    'msg_second_loop_checkpoint': {'en': 'First-loop approval saved; Pass 2 can be resumed later: {path}',
+                                   'zh': '第一圈确认结果已保存；可稍后恢复第二圈：{path}'},
+    'msg_second_loop_resumed': {'en': 'Resuming Pass 2 for project {name}', 'zh': '正在恢复项目 {name} 的第二圈'},
+    'msg_first_loop_paused': {'en': 'First loop for {name} is complete. All mapping sessions are stopped; recharge and resume Pass 2 later from Project Setup.',
+                              'zh': '项目 {name} 的第一圈已完成。已停止全部建图会话；可在充电和休整后从“项目配置”恢复第二圈。'},
     'two_loop_first_sensors': {'en': 'System Readiness', 'zh': '系统就绪'},
     'two_loop_first_sensors_desc': {'en': 'Start the lidar and IMU bridge, then release platform control. These nodes '
                                     'remain active throughout both mapping passes and are stopped only after the '
@@ -162,14 +175,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     'two_loop_finish_first': {'en': 'Finish Loop 1 and Generate PCD', 'zh': '完成第一圈并生成 PCD'},
     'two_loop_pcd_review': {'en': 'PCD Quality Review', 'zh': 'PCD 质量审核'},
     'two_loop_pcd_points': {'en': 'Preview points', 'zh': '预览点数'},
-    'two_loop_pcd_topdown': {'en': 'Top-down sampled PCD preview', 'zh': 'PCD 抽样俯视预览'},
+    'two_loop_pcd_xy': {'en': 'Top view (XY)', 'zh': '俯视图（XY）'},
+    'two_loop_pcd_xz': {'en': 'Front view (XZ)', 'zh': '正视图（XZ）'},
+    'two_loop_pcd_yz': {'en': 'Side view (YZ)', 'zh': '侧视图（YZ）'},
     'two_loop_pcd_external': {'en': 'Browser preview unavailable ({error}). Verify `{path}` in RViz or an external '
                               'point-cloud tool.',
                               'zh': '网页无法预览（{error}）。请使用 RViz 或外部点云工具确认 `{path}`。'},
-    'two_loop_pcd_confirm_desc': {'en': 'Confirm only after checking loop closure and coverage. Confirmation saves the '
-                                  'prior; the lidar and IMU bridge remain active for Pass 2.',
-                                  'zh': '请在确认回环和覆盖范围无误后继续。确认将保存定位先验；激光雷达和 IMU 桥接将保持运行，直接用于第二圈。'},
-    'two_loop_confirm_pcd': {'en': 'PCD Approved — Save Prior and Start Pass 2', 'zh': '确认 PCD 无误 — 保存先验并开始第二圈'},
+    'two_loop_pcd_confirm_desc': {'en': 'Confirm only after checking loop closure and coverage. You may continue directly to Pass 2 or stop the robot for charging and resume it later.',
+                                  'zh': '请在确认回环和覆盖范围无误后继续。可直接进入第二圈，也可安全结束本次作业，待充电和休整后恢复第二圈。'},
+    'two_loop_confirm_pcd': {'en': 'Approve PCD and Continue to Pass 2', 'zh': '确认 PCD 无误并继续第二圈'},
+    'two_loop_pause_after_pcd': {'en': 'Approve PCD and End This Session', 'zh': '确认 PCD 无误并结束本次作业'},
     'two_loop_second_header': {'en': 'Multi-Floor Mapping', 'zh': '多层建图'},
     'two_loop_start_relocal': {'en': 'Start Relocalized Faster-LIO', 'zh': '启动重定位 Faster-LIO'},
     'two_loop_start_relocal_desc': {'en': 'The confirmed PGO prior will be used for relocalization. GridMapper starts '
@@ -188,6 +203,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
                                  'zh': '未找到地图上下文元数据：`{path}`。可继续部署地图，但该项目无法提供可靠的人工巡检定位。'},
     'two_loop_preview_floor': {'en': 'Floor map to inspect', 'zh': '选择要检查的楼层地图'},
     'two_loop_preview_caption': {'en': '{map_id} occupancy map', 'zh': '{map_id} 栅格地图'},
+    'two_loop_preview_transparent': {'en': 'Blue-grey marks transparent pixels outside the exported map; black and white retain their occupancy meaning.',
+                                     'zh': '蓝灰色表示导出地图范围外的透明区域；黑色和白色仍保留原有栅格语义。'},
     'two_loop_review_maps_desc': {'en': 'Inspect every floor map before deployment. After confirmation, the PGO prior and '
                                   'complete multi-floor map set will be published atomically to `{destination}`.',
                                   'zh': '请逐一检查各楼层栅格地图。确认后，PGO 定位先验和完整多楼层地图将原子发布到 `{destination}`。'},
