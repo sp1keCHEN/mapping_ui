@@ -39,6 +39,47 @@ from pcd_preview import load_xyz, preview_summary, three_view_images
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Multi-Floor Mapping", layout="wide", initial_sidebar_state="expanded")
+st.markdown("""
+<style>
+/* Normal workflow actions use an unambiguous blue. */
+button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background-color: #1f6feb !important;
+    border-color: #1f6feb !important;
+    color: #ffffff !important;
+}
+button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
+    background-color: #1759bd !important;
+    border-color: #1759bd !important;
+}
+/* Stop/terminate actions are intentionally the only red controls. */
+div.st-key-sidebar_abort button,
+div.st-key-btn_refresh_stop button,
+div.st-key-btn_s4_stop button,
+div.st-key-btn_s4_reset button,
+div.st-key-two_pause_after_pcd button,
+div[class*="st-key-bar_stop_"] button {
+    background-color: #c7362f !important;
+    border-color: #c7362f !important;
+    color: #ffffff !important;
+}
+div.st-key-sidebar_abort button:hover,
+div.st-key-sidebar_abort button:focus,
+div.st-key-btn_refresh_stop button:hover,
+div.st-key-btn_refresh_stop button:focus,
+div.st-key-btn_s4_stop button:hover,
+div.st-key-btn_s4_stop button:focus,
+div.st-key-btn_s4_reset button:hover,
+div.st-key-btn_s4_reset button:focus,
+div.st-key-two_pause_after_pcd button:hover,
+div.st-key-two_pause_after_pcd button:focus,
+div[class*="st-key-bar_stop_"] button:hover,
+div[class*="st-key-bar_stop_"] button:focus {
+    background-color: #a92924 !important;
+    border-color: #a92924 !important;
+    color: #ffffff !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # Language selector — must be before any t() call
 if "lang" not in st.session_state:
@@ -139,10 +180,10 @@ ROS2_ENV = _ros2_env()
 KNOWN_SESSIONS = [
     {"name": "livox", "label": "Livox Lidar", "expected_nodes": ["/livox_lidar_publisher"]},
     {"name": "nav_bridge", "label": "nav_bridge IMU", "expected_nodes": ["/nav_bridge_node"]},
-    {"name": "slam", "label": "PGO SLAM + Rviz", "expected_nodes": ["/laser_mapping"]},
+    {"name": "slam", "label": "PGO SLAM", "expected_nodes": ["/laser_mapping"]},
     {"name": "bag_rec", "label": "Bag Recording", "expected_nodes": []},
     {"name": "relocal", "label": "Relocalization", "expected_nodes": ["/laser_mapping"]},
-    {"name": "gridmapper", "label": "Grid Mapper + Rviz", "expected_nodes": ["/gridmapper_node"]},
+    {"name": "gridmapper", "label": "GridMapper", "expected_nodes": ["/gridmapper_node"]},
     {"name": "map_context_recorder", "label": "Map Context Recorder", "expected_nodes": ["/map_context_recorder"]},
     {"name": "bag_play", "label": "Bag Playback", "expected_nodes": []},
     {"name": "build", "label": "colcon Build", "expected_nodes": []},
@@ -734,28 +775,66 @@ def clear_second_loop_checkpoint(map_name: str) -> None:
     checkpoint_path(map_name).unlink(missing_ok=True)
 
 
+def is_resumable_prior(directory: Path) -> bool:
+    """Check whether an approved first-loop prior can safely resume Pass 2."""
+    path = directory / CHECKPOINT_FILENAME
+    if not directory.is_dir() or not path.is_file():
+        return False
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        checkpoint.get("format_version") == 1
+        and checkpoint.get("project_name") == directory.name
+        and checkpoint.get("stage") == "pgo_approved"
+        and (directory / "PGO.pcd").is_file()
+        and (directory / "keyframes").is_dir()
+    )
+
+
 def resumable_projects() -> list[str]:
     """Return first-loop projects explicitly paused before second-loop mapping."""
     if not PRIOR_DIR.is_dir():
         return []
-    projects: list[str] = []
-    for directory in PRIOR_DIR.iterdir():
-        path = directory / CHECKPOINT_FILENAME
-        if not directory.is_dir() or not path.is_file():
-            continue
-        try:
-            checkpoint = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-        if (
-            checkpoint.get("format_version") == 1
-            and checkpoint.get("project_name") == directory.name
-            and checkpoint.get("stage") == "pgo_approved"
-            and (directory / "PGO.pcd").is_file()
-            and (directory / "keyframes").is_dir()
-        ):
-            projects.append(directory.name)
-    return sorted(projects)
+    return sorted(directory.name for directory in PRIOR_DIR.iterdir() if is_resumable_prior(directory))
+
+
+def project_inventory() -> list[dict[str, str]]:
+    """Summarize completed maps and first-loop priors for the project manager."""
+    names: set[str] = set()
+    if MAPS_ROOT.is_dir():
+        names.update(path.name for path in MAPS_ROOT.iterdir() if path.is_dir() and not path.name.startswith("."))
+    if PRIOR_DIR.is_dir():
+        names.update(path.name for path in PRIOR_DIR.iterdir() if path.is_dir() and not path.name.startswith("."))
+
+    rows: list[dict[str, str]] = []
+    for name in sorted(names):
+        prior = PRIOR_DIR / name
+        deployed = MAPS_ROOT / name
+        prior_ready = (prior / "PGO.pcd").is_file() and (prior / "keyframes").is_dir()
+        report = inspect_multimap_dir(deployed) if deployed.is_dir() else None
+        has_prior_dir = prior.is_dir()
+        has_deployed_dir = deployed.is_dir()
+        if report and report.valid and prior_ready:
+            state = "completed"
+            map_ids = ", ".join(report.map_ids)
+        elif prior_ready and is_resumable_prior(prior):
+            state = "ready_for_second"
+            map_ids = "—"
+        elif prior_ready:
+            state = "first_loop_only"
+            map_ids = "—"
+        else:
+            state = "incomplete"
+            map_ids = ", ".join(report.map_ids) if report and report.map_ids else "—"
+        source = (
+            "navigation_and_prior" if has_deployed_dir and has_prior_dir else
+            "navigation_project" if has_deployed_dir else
+            "pgo_prior"
+        )
+        rows.append({"name": name, "state": state, "source": source, "map_ids": map_ids})
+    return rows
 
 
 def save_approved_prior(map_name: str) -> bool:
@@ -812,6 +891,8 @@ def _init_state():
         "step_messages": [],
         "step1_livox_hz": 0.0,
         "step1_imu_hz": 0.0,
+        "sensor_livox_ready_reported": False,
+        "sensor_imu_ready_reported": False,
         "pgo_last_size": -1,
         "pgo_stable_count": 0,
         "pgo_files_stable_at": None,
@@ -865,50 +946,41 @@ def clear_wait_state():
 
 
 def render_initial_preparation(next_phase: str) -> bool:
-    """Render the one-time sensor and platform-control preparation sequence.
-
-    Returns True while the sequence owns the current workflow phase.
-    """
+    """Start sensor and bridge sessions together, then verify both inputs."""
     sub = st.session_state.current_sub
     phases = {
-        "start_livox": "first_livox",
-        "wait_livox": "wait_first_livox",
-        "start_nav": "first_nav",
-        "wait_nav": "wait_first_nav",
+        "start_system": "first_livox",
+        "wait_system": "wait_first_livox",
         "release": "first_release",
     }
-    if sub == phases["start_livox"]:
+    if sub == phases["start_system"]:
         st.markdown(t("two_loop_first_sensors_desc"))
-        if st.button(t("s1_start_livox"), type="primary", key="first_livox"):
+        if st.button(t("s1_start_system"), type="primary", key="first_livox"):
             add_message(t("msg_start_livox"))
             screen_launch("livox", LIVOX_LAUNCH_CMD)
-            st.session_state.current_sub = phases["wait_livox"]
-            st.session_state.wait_start = time.monotonic()
-            st.rerun()
-        return True
-    if sub == phases["wait_livox"]:
-        elapsed = max(0.0, time.monotonic() - get_wait_start())
-        st.progress(min(elapsed / 20, 1.0))
-        st.caption(t("s1_wait_topic", topic=LIVOX_TOPIC, elapsed=elapsed))
-        if get_topic_hz(LIVOX_TOPIC) > 0 or elapsed >= 20:
-            st.session_state.current_sub = phases["start_nav"]
-            clear_wait_state()
-            st.rerun()
-        return True
-    if sub == phases["start_nav"]:
-        st.markdown(t("s1_start_nav_desc"))
-        if st.button(t("s1_start_nav"), type="primary", key="first_nav"):
             add_message(t("msg_start_nav"))
             screen_launch("nav_bridge", NAV_BRIDGE_LAUNCH_CMD)
-            st.session_state.current_sub = phases["wait_nav"]
+            st.session_state.sensor_livox_ready_reported = False
+            st.session_state.sensor_imu_ready_reported = False
+            st.session_state.current_sub = phases["wait_system"]
             st.session_state.wait_start = time.monotonic()
             st.rerun()
         return True
-    if sub == phases["wait_nav"]:
+    if sub == phases["wait_system"]:
         elapsed = max(0.0, time.monotonic() - get_wait_start())
         st.progress(min(elapsed / 20, 1.0))
-        st.caption(t("s1_wait_topic", topic=IMU_TOPIC, elapsed=elapsed))
-        if get_topic_hz(IMU_TOPIC) > 0 or elapsed >= 20:
+        livox_hz = get_topic_hz(LIVOX_TOPIC)
+        imu_hz = get_topic_hz(IMU_TOPIC)
+        render_rate_metrics((t("s1_lidar_input"), livox_hz), (t("s1_imu_input"), imu_hz))
+        st.caption(t("s1_wait_sensor_inputs", elapsed=elapsed))
+        if livox_hz > 0 and not st.session_state.get("sensor_livox_ready_reported", False):
+            add_message(t("msg_livox_ready", hz=livox_hz))
+            st.session_state.sensor_livox_ready_reported = True
+        if imu_hz > 0 and not st.session_state.get("sensor_imu_ready_reported", False):
+            add_message(t("msg_imu_ready", hz=imu_hz))
+            st.session_state.sensor_imu_ready_reported = True
+        if livox_hz > 0 and imu_hz > 0:
+            add_message(t("msg_sensor_system_ready"))
             st.session_state.current_sub = phases["release"]
             clear_wait_state()
             st.rerun()
@@ -929,6 +1001,13 @@ def render_node_wait(node_name: str, elapsed: float, timeout: int = 30) -> None:
     st.progress(min(elapsed / timeout, 1.0))
     st.caption(t("s3_wait_node", node=node_name,
                elapsed=elapsed, seconds=timeout))
+
+
+def render_rate_metrics(*items: tuple[str, float]) -> None:
+    """Render input rates with the same prominent metric-card treatment."""
+    columns = st.columns(len(items))
+    for column, (label, hz) in zip(columns, items):
+        column.metric(label, f"{hz:.1f} Hz")
 
 
 def render_runtime_status(**sessions: str) -> None:
@@ -1050,15 +1129,15 @@ def render_sidebar():
             f"**{t('path_nav_maps')}:** `{MAPS_ROOT}/{mn}`"
         )
 
-    if 0 < st.session_state.current_step < 4:
-        st.sidebar.divider()
-        if st.sidebar.button(t("abort_mapping"), type="primary", key="sidebar_abort"):
-            screen_stop_all()
-            get_monitor_manager().reset()
-            add_message(t("abort_done"))
-            st.session_state.current_step = 0
-            st.session_state.current_sub = "start"
-            st.rerun()
+    st.sidebar.divider()
+    if st.sidebar.button(t("abort_mapping"), type="primary", key="sidebar_abort", width="stretch"):
+        screen_stop_all()
+        get_monitor_manager().reset()
+        add_message(t("abort_done"))
+        st.session_state.current_step = 0
+        st.session_state.current_sub = "start"
+        st.session_state.resume_second_loop = False
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1174,7 +1253,24 @@ def render_step0():
         st.warning(t("s0_setup_missing"))
     st.info(ws_info)
 
-    st.markdown(t("s0_desc"))
+    st.subheader(t("project_inventory_header"))
+    projects = project_inventory()
+    if projects:
+        st.dataframe(
+            [
+                {
+                    t("project_column_name"): project["name"],
+                    t("project_column_status"): t(f"project_status_{project['state']}"),
+                    t("project_column_source"): t(f"project_source_{project['source']}"),
+                    t("project_column_maps"): project["map_ids"],
+                }
+                for project in projects
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info(t("project_inventory_empty"))
 
     paused = resumable_projects()
     if paused:
@@ -1191,6 +1287,9 @@ def render_step0():
             add_message(t("msg_second_loop_resumed", name=selected))
             st.rerun()
 
+    st.divider()
+    st.subheader(t("new_project_header"))
+    st.markdown(t("s0_desc"))
     if st.button(t("start_workflow"), type="primary", key="btn_step0_start", disabled=st.session_state.action_in_progress):
         st.session_state.action_in_progress = True
         st.session_state.resume_second_loop = False
@@ -1355,10 +1454,11 @@ def _render_pcd_review(pcd_path: Path) -> None:
         columns[2].caption(f"Y：{summary['y_min']:.1f} ~ {summary['y_max']:.1f} m")
         columns[3].caption(f"Z：{summary['z_min']:.1f} ~ {summary['z_max']:.1f} m")
         views = three_view_images(xyz)
-        top, front, side = st.columns(3)
-        top.image(views["xy"], caption=t("two_loop_pcd_xy"), width="stretch")
+        front, left = st.columns(2)
         front.image(views["xz"], caption=t("two_loop_pcd_xz"), width="stretch")
-        side.image(views["yz"], caption=t("two_loop_pcd_yz"), width="stretch")
+        left.image(views["yz"], caption=t("two_loop_pcd_yz"), width="stretch")
+        top, _ = st.columns(2)
+        top.image(views["xy"], caption=t("two_loop_pcd_xy"), width="stretch")
     except (OSError, ValueError) as exc:
         st.warning(t("two_loop_pcd_external", path=pcd_path, error=exc))
 
@@ -1440,7 +1540,7 @@ def render_first_loop_pgo():
         with continue_col:
             continue_now = st.button(t("two_loop_confirm_pcd"), type="primary", key="two_confirm_pcd")
         with pause_col:
-            pause_after_review = st.button(t("two_loop_pause_after_pcd"), key="two_pause_after_pcd")
+            pause_after_review = st.button(t("two_loop_pause_after_pcd"), type="primary", key="two_pause_after_pcd")
         if continue_now or pause_after_review:
             if not save_approved_prior(project):
                 return
@@ -1501,7 +1601,7 @@ def render_second_loop_mapping():
     elif sub == "second_wait_inputs":
         cloud_hz = get_topic_hz("/cloud_registered_body_horizon")
         odom_hz = get_topic_hz("/odometry_horizon")
-        st.markdown(t("two_loop_input_status", cloud_hz=cloud_hz, odom_hz=odom_hz))
+        render_rate_metrics((t("s3_cloud_input"), cloud_hz), (t("s3_odometry_input"), odom_hz))
         if cloud_hz > 0 and odom_hz > 0:
             st.success(t("two_loop_input_ready"))
             st.session_state.current_sub = "second_drive"
