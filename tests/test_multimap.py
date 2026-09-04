@@ -21,7 +21,7 @@ def write_map_bundle(root: Path) -> None:
     for map_id in ("map_000", "map_001"):
         (root / f"{map_id}.png").write_bytes(b"png")
         (root / f"{map_id}.yaml").write_text(f"image: {map_id}.png\n")
-        (root / "states" / f"{map_id}.gridmap.bin").write_bytes(b"state")
+        (root / "states" / f"{map_id}.gridmap.bin.gz").write_bytes(b"state")
     (root / "map_relations.csv").write_text(",".join(RELATIONS_HEADER) + "\nROOT,map_000,0,0\nmap_000,map_001,1,2\n")
     (root / "transition_points.csv").write_text(",".join(TRANSITIONS_HEADER) + "\ntp_1,map_000,map_001,1,2,0,0,true,stairs\n")
 
@@ -65,8 +65,17 @@ class MultiMapTests(unittest.TestCase):
             write_map_bundle(root)
             (root / "map_001.png").unlink()
             (root / "map_001.yaml").unlink()
-            (root / "states" / "map_001.gridmap.bin").unlink()
+            (root / "states" / "map_001.gridmap.bin.gz").unlink()
             report = inspect_multimap_dir(root, allowed_unexported_map_ids={"map_001"})
+            self.assertTrue(report.valid, report.errors)
+
+    def test_legacy_bin_state_remains_accepted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_map_bundle(root)
+            compressed = root / "states" / "map_001.gridmap.bin.gz"
+            compressed.rename(root / "states" / "map_001.gridmap.bin")
+            report = inspect_multimap_dir(root)
             self.assertTrue(report.valid, report.errors)
 
     def test_binary_pcd_xyz_and_preview(self):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 
 import numpy as np
 
@@ -12,6 +13,43 @@ _TYPE_CODES = {
     ("I", 1): "<i1", ("I", 2): "<i2", ("I", 4): "<i4", ("I", 8): "<i8",
     ("U", 1): "<u1", ("U", 2): "<u2", ("U", 4): "<u4", ("U", 8): "<u8",
 }
+
+
+def _lzf_decompress(data: bytes, expected_size: int) -> bytes:
+    """Decompress the LZF payload used by PCL DATA binary_compressed."""
+    output = bytearray(expected_size)
+    ip = op = 0
+    while ip < len(data):
+        control = data[ip]
+        ip += 1
+        if control < 32:
+            length = control + 1
+            if ip + length > len(data) or op + length > expected_size:
+                raise ValueError("invalid LZF literal block")
+            output[op:op + length] = data[ip:ip + length]
+            ip += length
+            op += length
+            continue
+        length_code = control >> 5
+        length = length_code + 2
+        reference = op - 1 - ((control & 0x1F) << 8)
+        if length_code == 7:
+            if ip >= len(data):
+                raise ValueError("invalid LZF back-reference length")
+            length += data[ip]
+            ip += 1
+        if ip >= len(data):
+            raise ValueError("invalid LZF back-reference")
+        reference -= data[ip]
+        ip += 1
+        if reference < 0 or op + length > expected_size:
+            raise ValueError("invalid LZF back-reference range")
+        for index in range(length):
+            output[op] = output[reference + index]
+            op += 1
+    if op != expected_size:
+        raise ValueError("LZF payload size does not match PCD header")
+    return bytes(output)
 
 
 def load_xyz(path: Path, max_points: int = 25_000) -> np.ndarray:
@@ -33,8 +71,6 @@ def load_xyz(path: Path, max_points: int = 25_000) -> np.ndarray:
         parts = line.split()
         if len(parts) >= 2:
             header[parts[0].upper()] = parts[1:]
-    if header.get("DATA", [""])[0].lower() != "binary":
-        raise ValueError("only binary PCD is supported for browser preview")
     fields = header.get("FIELDS", [])
     sizes = [int(value) for value in header.get("SIZE", [])]
     types = header.get("TYPE", [])
@@ -53,9 +89,34 @@ def load_xyz(path: Path, max_points: int = 25_000) -> np.ndarray:
         dtype_fields.append((field, code, (count,)) if count > 1 else (field, code))
     dtype = np.dtype(dtype_fields)
     payload = path.read_bytes()[offset:]
-    if len(payload) < points * dtype.itemsize:
-        raise ValueError("PCD binary payload is shorter than its header declares")
-    cloud = np.frombuffer(payload, dtype=dtype, count=points)
+    data_format = header.get("DATA", [""])[0].lower()
+    if data_format == "binary":
+        if len(payload) < points * dtype.itemsize:
+            raise ValueError("PCD binary payload is shorter than its header declares")
+        cloud = np.frombuffer(payload, dtype=dtype, count=points)
+    elif data_format == "binary_compressed":
+        if len(payload) < 8:
+            raise ValueError("compressed PCD payload is missing size fields")
+        compressed_size, uncompressed_size = struct.unpack_from("<II", payload)
+        compressed = payload[8:]
+        if len(compressed) != compressed_size:
+            raise ValueError("compressed PCD payload size does not match its header")
+        raw = _lzf_decompress(compressed, uncompressed_size)
+        expected_size = points * dtype.itemsize
+        if uncompressed_size != expected_size:
+            raise ValueError("compressed PCD uncompressed size does not match its fields")
+        cloud = np.empty(points, dtype=dtype)
+        cursor = 0
+        for field, size, point_type, count in zip(fields, sizes, types, counts):
+            field_dtype = np.dtype(_TYPE_CODES[(point_type.upper(), size)])
+            field_bytes = points * size * count
+            values = np.frombuffer(raw[cursor:cursor + field_bytes], dtype=field_dtype)
+            if count > 1:
+                values = values.reshape(points, count)
+            cloud[field] = values
+            cursor += field_bytes
+    else:
+        raise ValueError(f"unsupported PCD DATA format: {data_format}; only binary and binary_compressed are supported")
     xyz = np.column_stack((cloud["x"], cloud["y"], cloud["z"])).astype(np.float32, copy=False)
     xyz = xyz[np.isfinite(xyz).all(axis=1)]
     if len(xyz) > max_points:

@@ -98,7 +98,7 @@ Web 界面采用三行式仪表盘布局，操作高度解耦，确保前台交�
 1. **启动在线栅格建图**：SLAM 就绪后，点击 **"启动在线栅格建图"**。界面会归档之前的 `data/Output/multi_maps`，再启动 GridMapper。
 2. **录制数据包**：GridMapper 启动后开始录制 `/livox/lidar` 与 `/imu/data` 原始数据，便于建图失败后离线排错；录包不再用于建图流程。
 3. **切换楼层**：行走到楼梯、电梯、门或走廊入口时，在“多楼层地图切换”区确认目标 ID（默认依次为 `map_000`、`map_001`…）、通道类型和是否双向；UI 立即调用 `/switch_map`。
-4. **结束与部署**：结束建图后，UI 停止录包并保存 GridMapper 与 PGO 输出，校验每张 `map_*.png/yaml`、`states/*.gridmap.bin`、两个 CSV 后，原子发布到 `~/Workspace/Maps/<项目>/`。无需重新编译导航包。
+4. **结束与部署**：结束建图后，UI 停止录包并保存 GridMapper 与 PGO 输出，校验每张 `map_*.png/yaml`、`states/<map_id>_<width>x<height>c.gridmap.bin.gz`（兼容旧格式）、两个 CSV 后，原子发布到 `~/Workspace/Maps/<项目>/`。尺寸字段为栅格 cell 数；实际米数等于 cell 数乘以 resolution。无需重新编译导航包。
 
 ### Step 4: 流程结束与后台清理
 * 界面会扫描当前是否还有残留的后台会话。

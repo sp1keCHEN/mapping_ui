@@ -102,8 +102,12 @@ def inspect_multimap_dir(
     for map_id in map_ids:
         if not (directory / f"{map_id}.png").is_file():
             errors.append(f"missing {map_id}.png")
-        if not (directory / "states" / f"{map_id}.gridmap.bin").is_file():
-            errors.append(f"missing states/{map_id}.gridmap.bin")
+        states_dir = directory / "states"
+        compressed_states = list(states_dir.glob(f"{map_id}_*x*c.gridmap.bin.gz"))
+        compressed_state = states_dir / f"{map_id}.gridmap.bin.gz"
+        legacy_state = states_dir / f"{map_id}.gridmap.bin"
+        if not (compressed_states or compressed_state.is_file() or legacy_state.is_file()):
+            errors.append(f"missing states/{map_id}.gridmap.bin.gz (or legacy .bin)")
 
     relations = _read_csv(directory / "map_relations.csv", RELATIONS_HEADER, errors)
     transitions = _read_csv(directory / "transition_points.csv", TRANSITIONS_HEADER, errors)
